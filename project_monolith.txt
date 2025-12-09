@@ -1,6 +1,36 @@
 # Monolithic project bundle
-# Generated: 2025-12-09T20:33:18Z
+# Generated: 2025-12-09T21:31:40Z
 # Repo root: /Users/andrewshaw/PycharmProjects/Bakckend-Casa
+
+-----8<----- FILE: .gitignore (254 bytes) -----
+```
+# Python virtual environment
+.venv/
+venv/
+ENV/
+
+# Python compiled files and cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Database
+app.db
+*.sqlite3
+
+# Environment variables
+.env
+
+# IDE configuration
+.idea/
+.vscode/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+```
+-----8<----- END FILE: .gitignore -----
 
 -----8<----- FILE: api.yaml (4584 bytes) -----
 ```yaml
@@ -221,16 +251,23 @@ components:
 ```
 -----8<----- END FILE: app/__init__.py -----
 
------8<----- FILE: app/api.py (3294 bytes) -----
+-----8<----- FILE: app/api.py (5037 bytes) -----
 ```python
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
+from types import SimpleNamespace
 from .db import session_scope, Base, engine
 from .models import Order as OrderModel
 from .schemas import OrderCreateRequest, Order as OrderSchema, Position as PositionSchema
 from .repositories.orders import OrderRepository
 from .repositories.positions import PositionsRepository
+# Fase 2 imports
+from .repositories.risk_limits import RiskLimitsRepository
+from .services.risk_service import validate_order
+from .services.metrics import record, snapshot
+from .services.reconciliation_service import reconcile_internal
 from .utils.enums import OrderStatus
 from .services.fix_gateway import fix_gateway
 
@@ -252,9 +289,41 @@ def health():
 
 @router.post("/orders", response_model=OrderSchema, status_code=201)
 def create_order(payload: OrderCreateRequest, db: Session = Depends(get_db)):
-    """Create an order, persist it, commit it so FIX worker can see it,
+    """Create an order after pre-trade risk validation, persist it, commit so FIX worker can see it,
     then enqueue FIX SEND event.
     """
+    # Fase 2.1 — Validación de riesgo
+    risk_repo = RiskLimitsRepository(db)
+    client_limit = risk_repo.by_client_symbol(payload.clientId, payload.symbol)
+    # Si no hay límites definidos para el cliente, definir unos permisivos por defecto para no bloquear MVP
+    if client_limit is None:
+        # 24x7, sin bloqueo ni límites muy restrictivos
+        client_limit = SimpleNamespace(
+            client_id=payload.clientId,
+            symbol=None,
+            max_notional=1e12,
+            max_order_size=1e9,
+            trading_hours="00:00-23:59",
+            blocked=False,
+        )
+    # Especificación del símbolo (estático)
+    symbol_spec = {
+        "ref_price": 2000.0 if payload.symbol.upper().startswith("XAU") else 1.10
+    }
+
+    ok, reason = validate_order(payload, client_limit, symbol_spec)
+    if not ok:
+        # Métricas
+        record("orders_rejected", 1)
+        record(f"risk_rejects:{reason}", 1)
+        return JSONResponse(status_code=400, content={
+            "error": "RISK_REJECT",
+            "reason": reason,
+        })
+
+    # Fase 2.3 — métrica de orden aceptada
+    record("orders_total", 1)
+
     repo = OrderRepository(db)
 
     order = repo.create({
@@ -319,6 +388,17 @@ def positions(clientId: str = Query(...), db: Session = Depends(get_db)):
     return [PositionSchema(**i) for i in items]
 
 
+# Fase 2.3 — Métricas
+@router.get("/metrics")
+def metrics():
+    return snapshot()
+
+# Fase 2.4 — Admin reconcile
+@router.get("/admin/reconcile/internal")
+def admin_reconcile(db: Session = Depends(get_db)):
+    return reconcile_internal(db)
+
+
 # --------------------------
 # Mapper DB → API Schema
 # --------------------------
@@ -373,12 +453,14 @@ def session_scope():
 ```
 -----8<----- END FILE: app/db.py -----
 
------8<----- FILE: app/main.py (446 bytes) -----
+-----8<----- FILE: app/main.py (527 bytes) -----
 ```python
 import uvicorn
 from fastapi import FastAPI
 from .api import router
 from .services.fix_gateway import fix_gateway
+# Fase 2.2 — WS router
+from .ws import ws_router
 
 app = FastAPI(title="OMS Backend (MVP)")
 
@@ -389,6 +471,7 @@ async def startup_event():
 
 # Add API routes
 app.include_router(router)
+app.include_router(ws_router)
 
 if __name__ == "__main__":
     uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
@@ -396,13 +479,17 @@ if __name__ == "__main__":
 ```
 -----8<----- END FILE: app/main.py -----
 
------8<----- FILE: app/models.py (1788 bytes) -----
+-----8<----- FILE: app/models.py (2494 bytes) -----
 ```python
 import uuid
 from datetime import datetime
-from sqlalchemy import String, Float, DateTime, ForeignKey
+from sqlalchemy import String, Float, DateTime, ForeignKey, Boolean
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .db import Base
+
+# ------------------------------
+# Fase 2 — Nuevos modelos
+# ------------------------------
 
 class Order(Base):
     __tablename__ = "orders"
@@ -435,6 +522,18 @@ class Execution(Base):
     exec_time: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     order: Mapped[Order] = relationship("Order", back_populates="executions")
+
+# Fase 2.1 — Tabla de límites de riesgo
+class RiskLimit(Base):
+    __tablename__ = "risk_limits"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    client_id: Mapped[str] = mapped_column(String, index=True)
+    symbol: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    max_notional: Mapped[float] = mapped_column(Float)
+    max_order_size: Mapped[float] = mapped_column(Float)
+    trading_hours: Mapped[str] = mapped_column(String)  # formato "HH:MM-HH:MM"
+    blocked: Mapped[bool] = mapped_column(Boolean, default=False)
 
 ```
 -----8<----- END FILE: app/models.py -----
@@ -523,6 +622,55 @@ class PositionsRepository:
 ```
 -----8<----- END FILE: app/repositories/positions.py -----
 
+-----8<----- FILE: app/repositories/risk_limits.py (1628 bytes) -----
+```python
+from typing import Optional, Iterable
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+from ..models import RiskLimit
+
+# Fase 2.1 — Repositorio CRUD para risk_limits
+class RiskLimitsRepository:
+    def __init__(self, db: Session):
+        self.db = db
+
+    def create(self, data: dict) -> RiskLimit:
+        item = RiskLimit(**data)
+        self.db.add(item)
+        self.db.flush()
+        return item
+
+    def get(self, id_: str) -> Optional[RiskLimit]:
+        return self.db.get(RiskLimit, id_)
+
+    def list(self, client_id: Optional[str] = None, symbol: Optional[str] = None) -> list[RiskLimit]:
+        stmt = select(RiskLimit)
+        if client_id is not None:
+            stmt = stmt.where(RiskLimit.client_id == client_id)
+        if symbol is not None:
+            stmt = stmt.where(RiskLimit.symbol == symbol)
+        return list(self.db.execute(stmt).scalars().all())
+
+    def by_client_symbol(self, client_id: str, symbol: str) -> Optional[RiskLimit]:
+        """Preferir un límite específico por símbolo; si no hay, usar el general (symbol IS NULL)."""
+        # Buscar límite específico
+        stmt_specific = select(RiskLimit).where(
+            RiskLimit.client_id == client_id,
+            RiskLimit.symbol == symbol,
+        )
+        specific = self.db.execute(stmt_specific).scalars().first()
+        if specific:
+            return specific
+        # Buscar límite general
+        stmt_general = select(RiskLimit).where(
+            RiskLimit.client_id == client_id,
+            RiskLimit.symbol.is_(None),
+        )
+        return self.db.execute(stmt_general).scalars().first()
+
+```
+-----8<----- END FILE: app/repositories/risk_limits.py -----
+
 -----8<----- FILE: app/schemas.py (1256 bytes) -----
 ```python
 from datetime import datetime
@@ -577,6 +725,44 @@ class Position(BaseModel):
 ```
 -----8<----- END FILE: app/schemas.py -----
 
+-----8<----- FILE: app/services/event_bus.py (1128 bytes) -----
+```python
+from collections import defaultdict
+from threading import Lock
+from typing import Callable, Any, Dict, List
+
+# Fase 2.2 — Event Bus in-memory (thread-safe básico)
+
+class EventBus:
+    def __init__(self):
+        self.subscribers: Dict[str, List[Callable[[Any], None]]] = defaultdict(list)
+        self._lock = Lock()
+
+    def subscribe(self, topic: str, callback: Callable[[Any], None]) -> None:
+        """Suscribe un callback sincrónico que recibirá `event`.
+        No devuelve unsubscribe para mantenerlo simple en MVP.
+        """
+        with self._lock:
+            self.subscribers[topic].append(callback)
+
+    def publish(self, topic: str, event: Any) -> None:
+        # Copiar lista bajo lock para evitar problemas si cambian durante iteración
+        with self._lock:
+            callbacks = list(self.subscribers.get(topic, []))
+        for cb in callbacks:
+            try:
+                cb(event)
+            except Exception as ex:
+                # Evitar que un callback rompa a los demás
+                print(f"[EventBus] callback error on {topic}: {ex}")
+
+
+# Instancia global
+event_bus = EventBus()
+
+```
+-----8<----- END FILE: app/services/event_bus.py -----
+
 -----8<----- FILE: app/services/events.py (140 bytes) -----
 ```python
 from dataclasses import dataclass
@@ -592,7 +778,7 @@ class CancelOrderEvent:
 ```
 -----8<----- END FILE: app/services/events.py -----
 
------8<----- FILE: app/services/fix_gateway.py (4909 bytes) -----
+-----8<----- FILE: app/services/fix_gateway.py (5651 bytes) -----
 ```python
 import random
 import time
@@ -603,6 +789,9 @@ from ..db import SessionLocal
 from ..models import Order as OrderModel, Execution
 from ..utils.enums import OrderStatus
 from .events import SendOrderEvent, CancelOrderEvent
+# Fase 2.2 — EventBus y métricas
+from .event_bus import event_bus
+from .metrics import record
 
 
 class FixGateway:
@@ -647,6 +836,19 @@ class FixGateway:
             finally:
                 self.queue.task_done()
 
+    def _publish_update(self, order: OrderModel):
+        event_bus.publish(
+            f"orders.{order.client_id}",
+            {
+                "type": "ORDER_UPDATE",
+                "orderId": order.id,
+                "status": order.status,
+                "cumQty": order.cum_qty,
+                "avgPx": order.avg_px,
+            },
+        )
+        record("fix_events_processed", 1)
+
     def _process_send(self, order_id: str):
         with SessionLocal() as db:
             order = db.get(OrderModel, order_id)
@@ -659,12 +861,14 @@ class FixGateway:
             db.add(order)
             db.commit()
             print(f"[FIX] Order {order_id} → PENDING_SEND")
+            self._publish_update(order)
 
             time.sleep(0.2)  # simulate delay
             order.status = OrderStatus.SENT
             db.add(order)
             db.commit()
             print(f"[FIX] Order {order_id} → SENT")
+            self._publish_update(order)
 
             # Process fills
             remaining = order.qty - order.cum_qty
@@ -677,6 +881,7 @@ class FixGateway:
                 db.add(order)
                 db.commit()
                 print(f"[FIX] Order {order_id} → REJECTED")
+                self._publish_update(order)
                 return
 
             # Simulate fill or partial fill
@@ -697,6 +902,7 @@ class FixGateway:
             db.add(order)
             db.commit()
             print(f"[FIX] Order {order_id} filled {lot1} @ {px}")
+            self._publish_update(order)
 
             # If partial, finish later
             if order.cum_qty < order.qty:
@@ -710,6 +916,7 @@ class FixGateway:
                 db.add(order)
                 db.commit()
                 print(f"[FIX] Order {order_id} final fill {lot2} @ {px}")
+                self._publish_update(order)
 
     def _process_cancel(self, order_id: str):
         with SessionLocal() as db:
@@ -731,6 +938,7 @@ class FixGateway:
             db.add(order)
             db.commit()
             print(f"[FIX] Order {order_id} → CANCELED")
+            self._publish_update(order)
 
     def _mock_market_px(self, symbol: str) -> float:
         base = 2000.0 if symbol.upper().startswith("XAU") else 1.1000
@@ -742,6 +950,236 @@ fix_gateway = FixGateway()
 
 ```
 -----8<----- END FILE: app/services/fix_gateway.py -----
+
+-----8<----- FILE: app/services/metrics.py (948 bytes) -----
+```python
+from collections import defaultdict
+from typing import Dict, Any
+
+# Fase 2.3 — Métricas básicas (in-memory)
+
+_orders_total = 0
+_orders_rejected = 0
+_risk_rejects: Dict[str, int] = defaultdict(int)
+_fix_events_processed = 0
+
+
+def record(metric_name: str, value: int = 1):
+    global _orders_total, _orders_rejected, _fix_events_processed
+    if metric_name == "orders_total":
+        _orders_total += value
+    elif metric_name == "orders_rejected":
+        _orders_rejected += value
+    elif metric_name.startswith("risk_rejects:"):
+        reason = metric_name.split(":", 1)[1]
+        _risk_rejects[reason] += value
+    elif metric_name == "fix_events_processed":
+        _fix_events_processed += value
+
+
+def snapshot() -> dict[str, Any]:
+    return {
+        "orders_total": _orders_total,
+        "orders_rejected": _orders_rejected,
+        "risk_rejects": dict(_risk_rejects),
+        "fix_events_processed": _fix_events_processed,
+    }
+
+```
+-----8<----- END FILE: app/services/metrics.py -----
+
+-----8<----- FILE: app/services/reconciliation_service.py (3824 bytes) -----
+```python
+from collections import defaultdict
+from typing import Dict, List
+from sqlalchemy.orm import Session
+from sqlalchemy import select, func
+from ..models import Order, Execution
+from ..repositories.positions import PositionsRepository
+from ..utils.enums import OrderStatus
+
+# Fase 2.4 — Reconciliación interna
+
+def reconcile_internal(db: Session) -> dict:
+    """
+    Verifica:
+      - order.cum_qty == sum(executions)
+      - status es coherente con qty y cum_qty
+      - positions coinciden con executions
+    Retorna dict con inconsistencias.
+    """
+    orders_inconsistent: List[dict] = []
+
+    # Precompute sums of executions per order
+    stmt_exec_sums = (
+        select(Execution.order_id, func.sum(Execution.exec_qty).label("sum_exec"))
+        .group_by(Execution.order_id)
+    )
+    exec_sums = {row.order_id: float(row.sum_exec or 0.0) for row in db.execute(stmt_exec_sums)}
+
+    # Check orders
+    orders = db.execute(select(Order)).scalars().all()
+    for o in orders:
+        s = float(exec_sums.get(o.id, 0.0))
+        inco_reasons: List[str] = []
+        if abs((o.cum_qty or 0.0) - s) > 1e-9:
+            inco_reasons.append("CUM_QTY_MISMATCH")
+
+        # Coherence with qty and cum_qty
+        qty = float(o.qty or 0.0)
+        cum = float(o.cum_qty or 0.0)
+        st = OrderStatus(o.status)
+        if st == OrderStatus.FILLED and abs(cum - qty) > 1e-9:
+            inco_reasons.append("STATUS_FILLED_BUT_CUM_QTY_NE_QTY")
+        if st == OrderStatus.PARTIALLY_FILLED and (cum <= 0 or cum >= qty):
+            inco_reasons.append("STATUS_PARTIAL_INCONSISTENT")
+        if st != OrderStatus.FILLED and abs(cum - qty) <= 1e-9 and qty > 0:
+            inco_reasons.append("STATUS_NOT_FILLED_BUT_CUM_EQ_QTY")
+
+        if inco_reasons:
+            orders_inconsistent.append({
+                "orderId": o.id,
+                "status": o.status,
+                "qty": qty,
+                "cumQty": cum,
+                "reasons": inco_reasons,
+            })
+
+    # Positions vs executions
+    positions_inconsistent: List[dict] = []
+    # Build positions from executions
+    # For each execution, sign depends on order side
+    # We need order sides for executions; join executions with orders
+    stmt_exec_detail = select(
+        Order.client_id, Order.symbol, Order.side, Execution.exec_qty, Execution.exec_px
+    ).join(Execution, Execution.order_id == Order.id)
+    rows = db.execute(stmt_exec_detail).all()
+
+    agg = defaultdict(float)
+    notional = defaultdict(float)
+    for r in rows:
+        sign = 1.0 if r.side == "BUY" else -1.0
+        agg[(r.client_id, r.symbol)] += sign * float(r.exec_qty)
+        notional[(r.client_id, r.symbol)] += float(r.exec_qty) * float(r.exec_px)
+
+    # Repo positions
+    repo = PositionsRepository(db)
+    repo_pos = repo.by_client  # function
+
+    # Compare per client found
+    clients = {cid for (cid, _sym) in agg.keys()}
+    for cid in clients:
+        calc = {(cid, sym): qty for (cid2, sym), qty in agg.items() if cid2 == cid}
+        # Convert repo list to mapping
+        repolist = repo_pos(cid)
+        repo_map = {(p["clientId"], p["symbol"]): float(p["netQty"]) for p in repolist}
+        # Compare keys union
+        keys = set(calc.keys()) | set(repo_map.keys())
+        for key in keys:
+            a = float(calc.get(key, 0.0))
+            b = float(repo_map.get(key, 0.0))
+            if abs(a - b) > 1e-9:
+                positions_inconsistent.append({
+                    "clientId": key[0],
+                    "symbol": key[1],
+                    "calcNetQty": a,
+                    "repoNetQty": b,
+                })
+
+    ok = not orders_inconsistent and not positions_inconsistent
+    return {
+        "ok": ok,
+        "orders_inconsistent": orders_inconsistent,
+        "positions_inconsistent": positions_inconsistent,
+    }
+
+```
+-----8<----- END FILE: app/services/reconciliation_service.py -----
+
+-----8<----- FILE: app/services/risk_service.py (2815 bytes) -----
+```python
+from datetime import datetime, time as time_cls
+from typing import Any, Tuple
+
+# Fase 2.1 — Servicio de riesgo (pre-trade)
+
+
+def _parse_trading_hours(th: str) -> tuple[datetime, datetime] | tuple[time_cls, time_cls]:
+    """Parsea string "HH:MM-HH:MM" a tupla de times.
+    No gestiona spans de día (e.g., 22:00-02:00) para mantenerlo simple MVP.
+    """
+    try:
+        start_s, end_s = th.split("-")
+        sh, sm = [int(x) for x in start_s.split(":")]
+        eh, em = [int(x) for x in end_s.split(":")]
+        return time_cls(sh, sm), time_cls(eh, em)
+    except Exception:
+        # si formato inválido, forzar rechazo por seguridad
+        return time_cls(23, 59), time_cls(0, 0)
+
+
+def validate_order(order_request: Any, client_risk: Any, symbol_spec: dict) -> Tuple[bool, str | None]:
+    """
+    Valida un request de orden contra límites de riesgo y especificación del símbolo.
+    Reglas:
+      - qty > 0
+      - si type == LIMIT → price requerido
+      - si type == MARKET → price debe ser None
+      - notional = qty * price (si MARKET usar precio de referencia del symbol_spec)
+      - notional <= max_notional
+      - qty <= max_order_size
+      - hora actual ∈ trading_hours (string tipo "09:00-16:00")
+      - símbolo no bloqueado
+    Retorna (ok, reason) donde reason es un string con la causa del rechazo.
+    """
+    # qty > 0
+    qty = float(order_request.qty)
+    if qty <= 0:
+        return False, "INVALID_QTY"
+
+    otype = getattr(order_request, "type")
+    price = getattr(order_request, "price", None)
+
+    # coherencia de precio según tipo
+    if str(otype) in ("OrderType.LIMIT", "LIMIT"):
+        if price is None:
+            return False, "PRICE_REQUIRED"
+    if str(otype) in ("OrderType.MARKET", "MARKET"):
+        if price is not None:
+            return False, "PRICE_NOT_ALLOWED"
+
+    # símbolo bloqueado
+    if getattr(client_risk, "blocked", False):
+        return False, "SYMBOL_BLOCKED"
+
+    # horario de trading
+    th = getattr(client_risk, "trading_hours", "00:00-23:59")
+    start_t, end_t = _parse_trading_hours(th)
+    now_t = datetime.now().time()
+    if not (start_t <= now_t <= end_t):
+        return False, "OUTSIDE_TRADING_HOURS"
+
+    # notional
+    if price is None:
+        ref_px = symbol_spec.get("ref_price")
+        try:
+            price = float(ref_px)
+        except Exception:
+            return False, "MISSING_REFERENCE_PRICE"
+    notional = qty * float(price)
+    max_notional = float(getattr(client_risk, "max_notional", float("inf")))
+    if notional > max_notional:
+        return False, "NOTIONAL_LIMIT_EXCEEDED"
+
+    # tamaño máximo por orden
+    max_order_size = float(getattr(client_risk, "max_order_size", float("inf")))
+    if qty > max_order_size:
+        return False, "ORDER_SIZE_LIMIT_EXCEEDED"
+
+    return True, None
+
+```
+-----8<----- END FILE: app/services/risk_service.py -----
 
 -----8<----- FILE: app/utils/enums.py (461 bytes) -----
 ```python
@@ -772,6 +1210,49 @@ class OrderStatus(str, Enum):
 
 ```
 -----8<----- END FILE: app/utils/enums.py -----
+
+-----8<----- FILE: app/ws.py (1093 bytes) -----
+```python
+import asyncio
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from .services.event_bus import event_bus
+
+# Fase 2.2 — WebSockets de órdenes por cliente
+
+ws_router = APIRouter()
+
+
+@ws_router.websocket("/ws/orders/{client_id}")
+async def ws_orders(websocket: WebSocket, client_id: str):
+    await websocket.accept()
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def on_event(evt):
+        # Recibir desde hilos externos de FIX, pasar al loop de asyncio
+        loop.call_soon_threadsafe(queue.put_nowait, evt)
+
+    # Suscribir al tópico del cliente
+    topic = f"orders.{client_id}"
+    event_bus.subscribe(topic, on_event)
+
+    try:
+        while True:
+            # Intentar enviar eventos pendientes
+            try:
+                evt = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                evt = None
+            if evt is not None:
+                await websocket.send_json(evt)
+            await asyncio.sleep(0.1)
+    except WebSocketDisconnect:
+        # Conexión terminada por el cliente
+        return
+
+```
+-----8<----- END FILE: app/ws.py -----
 
 -----8<----- FILE: flatten.sh (3251 bytes) -----
 ```bash
