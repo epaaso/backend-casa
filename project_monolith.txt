@@ -1,0 +1,1043 @@
+# Monolithic project bundle
+# Generated: 2025-12-09T20:33:18Z
+# Repo root: /Users/andrewshaw/PycharmProjects/Bakckend-Casa
+
+-----8<----- FILE: api.yaml (4584 bytes) -----
+```yaml
+openapi: 3.0.0
+info:
+  title: OMS Backend (MVP)
+  version: 1.0.0
+  description: Minimal backend API for sending trading orders to Centroid through an internal FIX engine.
+
+servers:
+  - url: http://localhost:8000
+
+paths:
+
+  /health:
+    get:
+      summary: Health check
+      responses:
+        '200':
+          description: OK
+
+  /orders:
+    post:
+      summary: Create a new trading order
+      description: >
+        Creates an order in the local OMS. The order is persisted and then
+        routed to the FIX engine which will forward it to Centroid.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderCreateRequest'
+      responses:
+        '201':
+          description: Order accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          description: Invalid order parameters
+
+    get:
+      summary: List orders
+      parameters:
+        - in: query
+          name: clientId
+          schema:
+            type: string
+        - in: query
+          name: symbol
+          schema:
+            type: string
+      responses:
+        '200':
+          description: List of orders
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Order'
+
+  /orders/{orderId}:
+    get:
+      summary: Get a single order by ID
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Order data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '404':
+          description: Not found
+
+  /orders/{orderId}/cancel:
+    post:
+      summary: Cancel an order
+      description: >
+        Requests cancellation. The FIX engine will send FIX Cancel (35=F)
+        to Centroid and update status when the ExecutionReport arrives.
+      parameters:
+        - in: path
+          name: orderId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Cancel request accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '404':
+          description: Order not found
+
+  /positions:
+    get:
+      summary: Get current positions for a client
+      parameters:
+        - in: query
+          name: clientId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Positions list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Position'
+
+components:
+
+  schemas:
+
+    OrderCreateRequest:
+      type: object
+      required:
+        - clientId
+        - symbol
+        - side
+        - type
+        - qty
+      properties:
+        clientId:
+          type: string
+        symbol:
+          type: string
+          example: XAUUSD
+        side:
+          type: string
+          enum: [BUY, SELL]
+        type:
+          type: string
+          enum: [MARKET, LIMIT]
+        qty:
+          type: number
+        price:
+          type: number
+          nullable: true
+        timeInForce:
+          type: string
+          enum: [GTC, DAY, IOC, FOK]
+          default: GTC
+
+    Order:
+      type: object
+      properties:
+        id:
+          type: string
+        clientId:
+          type: string
+        symbol:
+          type: string
+        side:
+          type: string
+        type:
+          type: string
+        qty:
+          type: number
+        price:
+          type: number
+          nullable: true
+        status:
+          type: string
+          enum:
+            - NEW
+            - PENDING_SEND
+            - SENT
+            - PARTIALLY_FILLED
+            - FILLED
+            - REJECTED
+            - CANCELED
+        cumQty:
+          type: number
+        avgPx:
+          type: number
+          nullable: true
+        createdAt:
+          type: string
+        updatedAt:
+          type: string
+
+    Position:
+      type: object
+      properties:
+        clientId:
+          type: string
+        symbol:
+          type: string
+        netQty:
+          type: number
+        avgPx:
+          type: number
+        unrealizedPnl:
+          type: number
+
+```
+-----8<----- END FILE: api.yaml -----
+
+-----8<----- FILE: app/__init__.py (26 bytes) -----
+```python
+# OMS Backend app package
+
+```
+-----8<----- END FILE: app/__init__.py -----
+
+-----8<----- FILE: app/api.py (3294 bytes) -----
+```python
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.orm import Session
+from .db import session_scope, Base, engine
+from .models import Order as OrderModel
+from .schemas import OrderCreateRequest, Order as OrderSchema, Position as PositionSchema
+from .repositories.orders import OrderRepository
+from .repositories.positions import PositionsRepository
+from .utils.enums import OrderStatus
+from .services.fix_gateway import fix_gateway
+
+router = APIRouter()
+
+# Ensure tables exist (MVP)
+Base.metadata.create_all(bind=engine)
+
+
+def get_db():
+    with session_scope() as s:
+        yield s
+
+
+@router.get("/health")
+def health():
+    return {"status": "OK"}
+
+
+@router.post("/orders", response_model=OrderSchema, status_code=201)
+def create_order(payload: OrderCreateRequest, db: Session = Depends(get_db)):
+    """Create an order, persist it, commit it so FIX worker can see it,
+    then enqueue FIX SEND event.
+    """
+    repo = OrderRepository(db)
+
+    order = repo.create({
+        "client_id": payload.clientId,
+        "symbol": payload.symbol,
+        "side": payload.side.value,
+        "type": payload.type.value,
+        "qty": payload.qty,
+        "price": payload.price,
+        "time_in_force": payload.timeInForce.value,
+        "status": OrderStatus.NEW.value,
+    })
+
+    db.flush()
+    db.commit()     # <<< CRITICAL FIX: allow worker thread to see the order
+
+    fix_gateway.enqueue_send(order.id)
+
+    return to_schema(order)
+
+
+@router.get("/orders", response_model=list[OrderSchema])
+def list_orders(
+    clientId: str | None = Query(default=None),
+    symbol: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    repo = OrderRepository(db)
+    items = repo.list(clientId, symbol)
+    return [to_schema(o) for o in items]
+
+
+@router.get("/orders/{orderId}", response_model=OrderSchema)
+def get_order(orderId: str, db: Session = Depends(get_db)):
+    repo = OrderRepository(db)
+    order = repo.get(orderId)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return to_schema(order)
+
+
+@router.post("/orders/{orderId}/cancel", response_model=OrderSchema)
+def cancel_order(orderId: str, db: Session = Depends(get_db)):
+    """Commit DB before enqueueing FIX cancel event."""
+    repo = OrderRepository(db)
+
+    order = repo.get(orderId)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    db.commit()     # <<< CRITICAL FIX: persist order state before FIX cancel
+
+    fix_gateway.enqueue_cancel(order.id)
+
+    return to_schema(order)
+
+
+@router.get("/positions", response_model=list[PositionSchema])
+def positions(clientId: str = Query(...), db: Session = Depends(get_db)):
+    repo = PositionsRepository(db)
+    items = repo.by_client(clientId)
+    return [PositionSchema(**i) for i in items]
+
+
+# --------------------------
+# Mapper DB → API Schema
+# --------------------------
+
+def to_schema(o: OrderModel) -> OrderSchema:
+    return OrderSchema(
+        id=o.id,
+        clientId=o.client_id,
+        symbol=o.symbol,
+        side=o.side,
+        type=o.type,
+        qty=o.qty,
+        price=o.price,
+        status=o.status,
+        cumQty=o.cum_qty,
+        avgPx=o.avg_px,
+        createdAt=o.created_at,
+        updatedAt=o.updated_at,
+    )
+
+```
+-----8<----- END FILE: app/api.py -----
+
+-----8<----- FILE: app/db.py (594 bytes) -----
+```python
+from contextlib import contextmanager
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, DeclarativeBase
+
+DATABASE_URL = "sqlite:///./app.db"
+
+engine = create_engine(
+    DATABASE_URL, connect_args={"check_same_thread": False}
+)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+class Base(DeclarativeBase):
+    pass
+
+@contextmanager
+def session_scope():
+    session = SessionLocal()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+```
+-----8<----- END FILE: app/db.py -----
+
+-----8<----- FILE: app/main.py (446 bytes) -----
+```python
+import uvicorn
+from fastapi import FastAPI
+from .api import router
+from .services.fix_gateway import fix_gateway
+
+app = FastAPI(title="OMS Backend (MVP)")
+
+# Start FIX worker properly when FastAPI starts — THIS IS CRITICAL
+@app.on_event("startup")
+async def startup_event():
+    fix_gateway.start()
+
+# Add API routes
+app.include_router(router)
+
+if __name__ == "__main__":
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+
+```
+-----8<----- END FILE: app/main.py -----
+
+-----8<----- FILE: app/models.py (1788 bytes) -----
+```python
+import uuid
+from datetime import datetime
+from sqlalchemy import String, Float, DateTime, ForeignKey
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from .db import Base
+
+class Order(Base):
+    __tablename__ = "orders"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    client_id: Mapped[str] = mapped_column(String, index=True)
+    symbol: Mapped[str] = mapped_column(String, index=True)
+    side: Mapped[str] = mapped_column(String)
+    type: Mapped[str] = mapped_column(String)
+    qty: Mapped[float] = mapped_column(Float)
+    price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    time_in_force: Mapped[str] = mapped_column(String, default="GTC")
+
+    status: Mapped[str] = mapped_column(String, default="NEW", index=True)
+    cum_qty: Mapped[float] = mapped_column(Float, default=0.0)
+    avg_px: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    executions: Mapped[list["Execution"]] = relationship("Execution", back_populates="order", cascade="all, delete-orphan")
+
+class Execution(Base):
+    __tablename__ = "executions"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    order_id: Mapped[str] = mapped_column(String, ForeignKey("orders.id", ondelete="CASCADE"), index=True)
+    exec_qty: Mapped[float] = mapped_column(Float)
+    exec_px: Mapped[float] = mapped_column(Float)
+    exec_time: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    order: Mapped[Order] = relationship("Order", back_populates="executions")
+
+```
+-----8<----- END FILE: app/models.py -----
+
+-----8<----- FILE: app/repositories/orders.py (1033 bytes) -----
+```python
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+from ..models import Order as OrderModel
+from ..utils.enums import OrderStatus
+
+class OrderRepository:
+    def __init__(self, db: Session):
+        self.db = db
+
+    def create(self, data: dict) -> OrderModel:
+        order = OrderModel(**data)
+        self.db.add(order)
+        self.db.flush()  # assign id
+        return order
+
+    def get(self, order_id: str) -> OrderModel | None:
+        return self.db.get(OrderModel, order_id)
+
+    def list(self, client_id: str | None, symbol: str | None) -> list[OrderModel]:
+        stmt = select(OrderModel)
+        if client_id:
+            stmt = stmt.where(OrderModel.client_id == client_id)
+        if symbol:
+            stmt = stmt.where(OrderModel.symbol == symbol)
+        return list(self.db.execute(stmt).scalars().all())
+
+    def save(self, order: OrderModel):
+        self.db.add(order)
+
+    def set_status(self, order: OrderModel, status: OrderStatus):
+        order.status = status
+        self.db.add(order)
+
+```
+-----8<----- END FILE: app/repositories/orders.py -----
+
+-----8<----- FILE: app/repositories/positions.py (1375 bytes) -----
+```python
+from sqlalchemy import select, func, case
+from sqlalchemy.orm import Session
+from ..models import Order, Execution
+
+class PositionsRepository:
+    def __init__(self, db: Session):
+        self.db = db
+
+    def by_client(self, client_id: str) -> list[dict]:
+        signed_qty = case(
+            (Order.side == "BUY", Execution.exec_qty),
+            else_=-Execution.exec_qty,
+        )
+        sub = (
+            select(
+                Order.client_id.label("clientId"),
+                Order.symbol.label("symbol"),
+                func.sum(signed_qty).label("netQty"),
+                (
+                    func.sum(Execution.exec_qty * Execution.exec_px)
+                    / func.nullif(func.sum(Execution.exec_qty), 0)
+                ).label("avgPx"),
+            )
+            .join(Execution, Execution.order_id == Order.id)
+            .where(Order.client_id == client_id)
+            .group_by(Order.client_id, Order.symbol)
+        )
+        rows = self.db.execute(sub).all()
+        positions = []
+        for r in rows:
+            net_qty = float(r.netQty or 0)
+            avg_px = float(r.avgPx or 0)
+            positions.append({
+                "clientId": r.clientId,
+                "symbol": r.symbol,
+                "netQty": net_qty,
+                "avgPx": avg_px,
+                "unrealizedPnl": 0.0,
+            })
+        return positions
+
+```
+-----8<----- END FILE: app/repositories/positions.py -----
+
+-----8<----- FILE: app/schemas.py (1256 bytes) -----
+```python
+from datetime import datetime
+from pydantic import BaseModel, Field, field_validator
+from typing import Optional
+from .utils.enums import Side, OrderType, TimeInForce, OrderStatus
+
+class OrderCreateRequest(BaseModel):
+    clientId: str
+    symbol: str
+    side: Side
+    type: OrderType
+    qty: float = Field(gt=0)
+    price: Optional[float] = None
+    timeInForce: TimeInForce = TimeInForce.GTC
+
+    @field_validator("price")
+    @classmethod
+    def validate_price(cls, v, info):
+        values = info.data
+        otype = values.get("type")
+        if otype == OrderType.LIMIT and v is None:
+            raise ValueError("price is required for LIMIT orders")
+        if otype == OrderType.MARKET and v is not None:
+            raise ValueError("price must be null for MARKET orders")
+        return v
+
+class Order(BaseModel):
+    id: str
+    clientId: str
+    symbol: str
+    side: Side
+    type: OrderType
+    qty: float
+    price: Optional[float] = None
+    status: OrderStatus
+    cumQty: float
+    avgPx: Optional[float] = None
+    createdAt: datetime
+    updatedAt: datetime
+
+    class Config:
+        from_attributes = True
+
+class Position(BaseModel):
+    clientId: str
+    symbol: str
+    netQty: float
+    avgPx: float
+    unrealizedPnl: float
+
+```
+-----8<----- END FILE: app/schemas.py -----
+
+-----8<----- FILE: app/services/events.py (140 bytes) -----
+```python
+from dataclasses import dataclass
+
+@dataclass
+class SendOrderEvent:
+    order_id: str
+
+@dataclass
+class CancelOrderEvent:
+    order_id: str
+
+```
+-----8<----- END FILE: app/services/events.py -----
+
+-----8<----- FILE: app/services/fix_gateway.py (4909 bytes) -----
+```python
+import random
+import time
+import threading
+from queue import Queue, Empty
+from sqlalchemy.orm import Session
+from ..db import SessionLocal
+from ..models import Order as OrderModel, Execution
+from ..utils.enums import OrderStatus
+from .events import SendOrderEvent, CancelOrderEvent
+
+
+class FixGateway:
+    def __init__(self):
+        # Queue of events to process
+        self.queue: Queue = Queue()
+
+        # Thread that processes events — not started here!
+        self.worker_thread = None
+
+    def start(self):
+        """Start the FIX worker thread once FastAPI starts."""
+        if self.worker_thread is None:
+            print("Starting FIX worker thread...")
+            self.worker_thread = threading.Thread(
+                target=self._worker,
+                daemon=True
+            )
+            self.worker_thread.start()
+
+    def enqueue_send(self, order_id: str):
+        print(f"[FIX] Enqueued SEND {order_id}")
+        self.queue.put(SendOrderEvent(order_id))
+
+    def enqueue_cancel(self, order_id: str):
+        print(f"[FIX] Enqueued CANCEL {order_id}")
+        self.queue.put(CancelOrderEvent(order_id))
+
+    def _worker(self):
+        print("FIX worker STARTED")
+        while True:
+            try:
+                evt = self.queue.get(timeout=1)
+            except Empty:
+                continue
+
+            try:
+                if isinstance(evt, SendOrderEvent):
+                    self._process_send(evt.order_id)
+                elif isinstance(evt, CancelOrderEvent):
+                    self._process_cancel(evt.order_id)
+            finally:
+                self.queue.task_done()
+
+    def _process_send(self, order_id: str):
+        with SessionLocal() as db:
+            order = db.get(OrderModel, order_id)
+            if not order:
+                print(f"[FIX] Order NOT FOUND: {order_id}")
+                return
+
+            # Move to PENDING_SEND
+            order.status = OrderStatus.PENDING_SEND
+            db.add(order)
+            db.commit()
+            print(f"[FIX] Order {order_id} → PENDING_SEND")
+
+            time.sleep(0.2)  # simulate delay
+            order.status = OrderStatus.SENT
+            db.add(order)
+            db.commit()
+            print(f"[FIX] Order {order_id} → SENT")
+
+            # Process fills
+            remaining = order.qty - order.cum_qty
+            if remaining <= 0:
+                return
+
+            # 10% reject chance
+            if random.random() < 0.1:
+                order.status = OrderStatus.REJECTED
+                db.add(order)
+                db.commit()
+                print(f"[FIX] Order {order_id} → REJECTED")
+                return
+
+            # Simulate fill or partial fill
+            partial = random.random() < 0.5
+            lot1 = remaining * (0.4 if partial else 1.0)
+            px = order.price or self._mock_market_px(order.symbol)
+
+            # First fill
+            exec1 = Execution(order_id=order.id, exec_qty=lot1, exec_px=px)
+            db.add(exec1)
+            order.cum_qty += lot1
+            order.avg_px = px if order.avg_px is None else (order.avg_px + px) / 2
+            order.status = (
+                OrderStatus.PARTIALLY_FILLED
+                if order.cum_qty < order.qty
+                else OrderStatus.FILLED
+            )
+            db.add(order)
+            db.commit()
+            print(f"[FIX] Order {order_id} filled {lot1} @ {px}")
+
+            # If partial, finish later
+            if order.cum_qty < order.qty:
+                time.sleep(0.3)
+                lot2 = order.qty - order.cum_qty
+                exec2 = Execution(order_id=order.id, exec_qty=lot2, exec_px=px)
+                db.add(exec2)
+                order.cum_qty += lot2
+                order.avg_px = px if order.avg_px is None else (order.avg_px + px) / 2
+                order.status = OrderStatus.FILLED
+                db.add(order)
+                db.commit()
+                print(f"[FIX] Order {order_id} final fill {lot2} @ {px}")
+
+    def _process_cancel(self, order_id: str):
+        with SessionLocal() as db:
+            order = db.get(OrderModel, order_id)
+            if not order:
+                print(f"[FIX] Cancel ignored: Order not found {order_id}")
+                return
+
+            if order.status in (
+                OrderStatus.FILLED,
+                OrderStatus.CANCELED,
+                OrderStatus.REJECTED,
+            ):
+                print(f"[FIX] Cancel ignored: Order {order_id} already terminal")
+                return
+
+            time.sleep(0.2)
+            order.status = OrderStatus.CANCELED
+            db.add(order)
+            db.commit()
+            print(f"[FIX] Order {order_id} → CANCELED")
+
+    def _mock_market_px(self, symbol: str) -> float:
+        base = 2000.0 if symbol.upper().startswith("XAU") else 1.1000
+        return round(base + random.uniform(-1, 1), 2)
+
+
+# Global instance
+fix_gateway = FixGateway()
+
+```
+-----8<----- END FILE: app/services/fix_gateway.py -----
+
+-----8<----- FILE: app/utils/enums.py (461 bytes) -----
+```python
+from enum import Enum
+
+class Side(str, Enum):
+    BUY = "BUY"
+    SELL = "SELL"
+
+class OrderType(str, Enum):
+    MARKET = "MARKET"
+    LIMIT = "LIMIT"
+
+class TimeInForce(str, Enum):
+    GTC = "GTC"
+    DAY = "DAY"
+    IOC = "IOC"
+    FOK = "FOK"
+
+class OrderStatus(str, Enum):
+    NEW = "NEW"
+    PENDING_SEND = "PENDING_SEND"
+    SENT = "SENT"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    FILLED = "FILLED"
+    REJECTED = "REJECTED"
+    CANCELED = "CANCELED"
+
+```
+-----8<----- END FILE: app/utils/enums.py -----
+
+-----8<----- FILE: flatten.sh (3251 bytes) -----
+```bash
+#!/usr/bin/env bash
+# Flatten this repository into a single monolithic text file for LLM analysis.
+# Usage:
+#   ./flatten.sh [OUTPUT_FILE]
+# Default OUTPUT_FILE is project_monolith.txt in repo root.
+# Notes:
+# - Only text files are included (based on `file --mime`), binaries are skipped.
+# - Common junk/virtual/cache directories are excluded.
+# - Each file is wrapped with a clear delimiter that includes its relative path.
+
+set -euo pipefail
+
+# Determine repo root (directory of this script)
+REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$REPO_ROOT"
+
+OUTPUT_FILE="${1:-project_monolith.txt}"
+
+# Stat helper supporting macOS and Linux
+file_size() {
+  local f="$1"
+  if command -v gstat >/dev/null 2>&1; then
+    gstat -c %s "$f"
+  elif stat -f %z "$f" >/dev/null 2>&1; then
+    stat -f %z "$f"  # macOS
+  else
+    stat -c %s "$f"  # Linux
+  fi
+}
+
+# Decide if a file is text (skip binaries)
+is_text_file() {
+  local f="$1"
+  local mt
+  mt=$(file -b --mime-type "$f" 2>/dev/null || echo "application/octet-stream")
+  [[ "$mt" == text/* || "$mt" == application/json || "$mt" == application/xml || "$mt" == application/x-sh ]] \
+    && return 0 || return 1
+}
+
+# Exclude patterns
+should_exclude() {
+  local f="$1"
+  case "$f" in
+    ./$(basename "$OUTPUT_FILE") ) return 0;;
+    ./.git/*|.git) return 0;;
+    ./.svn/*|.svn) return 0;;
+    ./.hg/*|.hg) return 0;;
+    ./.idea/*|.idea) return 0;;
+    ./.vscode/*|.vscode) return 0;;
+    ./node_modules/*|node_modules) return 0;;
+    ./.venv/*|.venv) return 0;;
+    ./venv/*|venv) return 0;;
+    ./*__pycache__/*|*__pycache__*) return 0;;
+    ./.pytest_cache/*|.pytest_cache) return 0;;
+    ./.mypy_cache/*|.mypy_cache) return 0;;
+    ./.coverage|.coverage) return 0;;
+    ./*.pyc|*.pyc) return 0;;
+    ./dist/*|dist) return 0;;
+    ./build/*|build) return 0;;
+    ./*.db|*.db) return 0;;
+    ./*.sqlite|*.sqlite) return 0;;
+    ./*.sqlite3|*.sqlite3) return 0;;
+    ./.DS_Store|.DS_Store) return 0;;
+    *) return 1;;
+  esac
+}
+
+# Initialize output
+: > "$OUTPUT_FILE"
+
+# Header
+{
+  echo "# Monolithic project bundle"
+  echo "# Generated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  echo "# Repo root: $REPO_ROOT"
+  echo
+} >> "$OUTPUT_FILE"
+
+# Collect and sort files
+
+append_file() {
+  local f="$1"
+  local rel="${f#./}"
+  local size
+  size=$(file_size "$f" 2>/dev/null || echo 0)
+
+  # Delimiter header
+  {
+    echo "-----8<----- FILE: $rel ($size bytes) -----"
+    # Provide an indicative code fence for some common types
+    case "$rel" in
+      *.py) echo '```python';;
+      *.yaml|*.yml) echo '```yaml';;
+      *.json) echo '```json';;
+      *.sh) echo '```bash';;
+      *.md) echo '```markdown';;
+      *) echo '```';;
+    esac
+    cat "$f"
+    echo
+    echo '```'
+    echo "-----8<----- END FILE: $rel -----"
+    echo
+  } >> "$OUTPUT_FILE"
+}
+
+# Iterate sorted file list in a portable way (no mapfile)
+find . -type f \
+  ! -name ".git" -a ! -path "*/.git/*" \
+  -print | LC_ALL=C sort | while IFS= read -r f; do
+  # Skip the output file itself and excluded paths
+  if should_exclude "$f"; then
+    continue
+  fi
+  # Include only text-like files
+  if is_text_file "$f"; then
+    append_file "$f"
+  fi
+done
+
+# Summary footer
+{
+  echo "# End of bundle"
+} >> "$OUTPUT_FILE"
+
+echo "Created monolith: $OUTPUT_FILE"
+
+```
+-----8<----- END FILE: flatten.sh -----
+
+-----8<----- FILE: requirements.txt (114 bytes) -----
+```
+fastapi==0.115.2
+uvicorn==0.30.6
+SQLAlchemy==2.0.36
+pydantic==2.9.2
+pydantic-settings==2.6.1
+python-dotenv==1.0.1
+
+```
+-----8<----- END FILE: requirements.txt -----
+
+-----8<----- FILE: smoke_tests.py (2963 bytes) -----
+```python
+#!/usr/bin/env python3
+import time
+import uuid
+import requests
+
+BASE = "http://localhost:8000"
+
+# ----------------------
+# Helper functions
+# ----------------------
+
+def check_health():
+    print(">> Checking /health ...")
+    r = requests.get(f"{BASE}/health")
+    assert r.status_code == 200
+    assert r.json().get("status") == "OK"
+    print("   PASSED")
+
+
+def create_order():
+    print(">> Creating order /orders ...")
+    payload = {
+        "clientId": "SMOKE",
+        "symbol": "XAUUSD",
+        "side": "BUY",
+        "type": "LIMIT",
+        "qty": 1,
+        "price": 2000.0,
+        "timeInForce": "GTC",
+    }
+    r = requests.post(f"{BASE}/orders", json=payload)
+    assert r.status_code == 201, f"Expected 201, got {r.status_code}"
+    order = r.json()
+    print("   Order created:", order["id"])
+    return order["id"]
+
+
+def get_order(order_id):
+    r = requests.get(f"{BASE}/orders/{order_id}")
+    assert r.status_code == 200, "Expected 200 for GET order"
+    return r.json()
+
+
+def wait_for_order_state_change(order_id, max_wait=3.0, interval=0.2):
+    print(">> Waiting for order state to change from NEW ...")
+
+    elapsed = 0
+    while elapsed < max_wait:
+        order = get_order(order_id)
+        if order["status"] != "NEW":
+            print(f"   Status changed to: {order['status']}")
+            return order
+        time.sleep(interval)
+        elapsed += interval
+
+    raise AssertionError("Order stayed in NEW state too long — FIX mock may not be running")
+
+
+def list_orders():
+    print(">> Listing /orders?clientId=SMOKE ...")
+    r = requests.get(f"{BASE}/orders", params={"clientId": "SMOKE"})
+    assert r.status_code == 200
+    data = r.json()
+    print(f"   Found {len(data)} orders")
+    return data
+
+
+def cancel_fake_order():
+    print(">> Cancelling non-existing order (expect 404) ...")
+    fake_id = str(uuid.uuid4())
+    r = requests.post(f"{BASE}/orders/{fake_id}/cancel")
+    assert r.status_code == 404, f"Expected 404, got {r.status_code}"
+    print("   PASSED (404 received)")
+
+
+def get_positions():
+    print(">> GET /positions?clientId=SMOKE ...")
+    r = requests.get(f"{BASE}/positions", params={"clientId": "SMOKE"})
+    assert r.status_code == 200
+    positions = r.json()
+    print("   Positions:", positions)
+    return positions
+
+
+# ----------------------
+# Smoke Test Runner
+# ----------------------
+
+def run():
+    print("\n=== SMOKE TESTS START ===\n")
+
+    check_health()
+
+    order_id = create_order()
+
+    # Wait for FIX mock to process fills
+    order = wait_for_order_state_change(order_id)
+
+    # Final state must be one of:
+    valid_states = (
+        "PENDING_SEND",
+        "SENT",
+        "PARTIALLY_FILLED",
+        "FILLED",
+        "REJECTED",
+    )
+    assert order["status"] in valid_states, f"Unexpected status: {order['status']}"
+
+    list_orders()
+    cancel_fake_order()
+    get_positions()
+
+    print("\n=== ALL SMOKE TESTS PASSED ===\n")
+
+
+if __name__ == "__main__":
+    run()
+
+```
+-----8<----- END FILE: smoke_tests.py -----
+
+# End of bundle
