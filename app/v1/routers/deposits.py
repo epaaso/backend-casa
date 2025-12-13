@@ -1,0 +1,84 @@
+import os
+import logging
+from fastapi import APIRouter, Depends, HTTPException, Query, Header, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ...db import get_session
+from ...utils.enums import DepositStatus
+from ...models import DepositIntent
+from ..repositories.deposits import DepositIntentRepository
+from ..schemas.deposits import DepositIntentCreate, DepositIntentOut
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/deposits", tags=["Deposits"])
+
+def _resolve_client_id(clientId: str | None, x_client_id: str | None) -> str:
+    return clientId or x_client_id or "demo-client-1"
+
+def _is_sandbox() -> bool:
+    return os.getenv("DEBUG", "0") == "1" or os.getenv("TESTING", "0") == "1"
+
+@router.post("", response_model=DepositIntentOut, status_code=status.HTTP_201_CREATED)
+async def create_deposit_intent(
+    payload: DepositIntentCreate,
+    clientId: str | None = Query(default=None),
+    x_client_id: str | None = Header(default=None, alias="X-Client-Id"),
+    db: AsyncSession = Depends(get_session),
+):
+    client_id = _resolve_client_id(clientId, x_client_id)
+
+    logger.info(f"📥 [CREATE DEPOSIT] amount={payload.amount}, provider={payload.provider}, client_id={client_id}")
+
+    repo = DepositIntentRepository(db)
+    intent = await repo.create({
+        "client_id": client_id,
+        "amount": float(payload.amount),
+        "currency": payload.currency,
+        "payment_method": payload.payment_method,
+        "provider": payload.provider,
+        "status": DepositStatus.PENDING.value,
+        "metadata_": payload.metadata,
+    })
+
+    await db.commit()
+    await db.refresh(intent)
+
+    logger.info(f"💾 [CREATE DEPOSIT] Saved: deposit_id={intent.id}, amount={intent.amount}, provider={intent.provider}, payment_url={intent.payment_url}")
+
+    # Auto-complete ONLY if provider == mock_stripe and sandbox enabled
+    if payload.provider == "mock_stripe" and _is_sandbox():
+        intent.status = DepositStatus.COMPLETED.value
+        intent.confirmed_amount = intent.amount
+        await db.commit()
+        await db.refresh(intent)
+        logger.info(f"🤖 [AUTO-COMPLETE] Deposit {intent.id} completed in sandbox (client_id={client_id})")
+
+    return DepositIntentOut.from_orm_row(intent)
+
+@router.get("", response_model=list[DepositIntentOut])
+async def list_deposit_intents(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    clientId: str | None = Query(default=None),
+    x_client_id: str | None = Header(default=None, alias="X-Client-Id"),
+    db: AsyncSession = Depends(get_session),
+):
+    client_id = _resolve_client_id(clientId, x_client_id)
+    repo = DepositIntentRepository(db)
+    items = await repo.list_for_client(client_id, limit, offset)
+    return [DepositIntentOut.from_orm_row(i) for i in items]
+
+@router.get("/{deposit_id}", response_model=DepositIntentOut)
+async def get_deposit_intent(
+    deposit_id: str,
+    clientId: str | None = Query(default=None),
+    x_client_id: str | None = Header(default=None, alias="X-Client-Id"),
+    db: AsyncSession = Depends(get_session),
+):
+    client_id = _resolve_client_id(clientId, x_client_id)
+    repo = DepositIntentRepository(db)
+    intent = await repo.get_by_id(deposit_id, client_id)
+    if not intent:
+        raise HTTPException(status_code=404, detail="Depósito no encontrado")
+    return DepositIntentOut.from_orm_row(intent)

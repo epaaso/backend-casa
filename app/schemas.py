@@ -4,7 +4,7 @@ from typing import Optional
 from .utils.enums import Side, OrderType, TimeInForce, OrderStatus
 
 class OrderCreateRequest(BaseModel):
-    clientId: str
+    clientId: Optional[str] = None
     symbol: str
     side: Side
     type: OrderType
@@ -33,12 +33,18 @@ class Order(BaseModel):
     price: Optional[float] = None
     status: OrderStatus
     cumQty: float
+    filledQty: float
     avgPx: Optional[float] = None
+    rejectReason: Optional[str] = None
     createdAt: datetime
     updatedAt: datetime
 
     class Config:
         from_attributes = True
+
+class OrderAmendRequest(BaseModel):
+    price: Optional[float] = None
+    qty: Optional[float] = None
 
 class Position(BaseModel):
     clientId: str

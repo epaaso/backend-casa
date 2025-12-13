@@ -22,6 +22,13 @@ paths:
       description: >
         Creates an order in the local OMS. The order is persisted and then
         routed to the FIX engine which will forward it to Centroid.
+      parameters:
+        - in: header
+          name: X-Client-Id
+          required: false
+          description: Optional. Client ID can be sent in body as clientId or in this header.
+          schema:
+            type: string
       requestBody:
         required: true
         content:
@@ -35,14 +42,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Order'
-        '400':
-          description: Invalid order parameters
+        '422':
+          description: Validation error
 
     get:
       summary: List orders
+      description: Requires a client identifier provided either as query ?clientId= or header X-Client-Id. Returns 400 if neither provided.
       parameters:
         - in: query
           name: clientId
+          schema:
+            type: string
+        - in: header
+          name: X-Client-Id
+          required: false
           schema:
             type: string
         - in: query
@@ -58,6 +71,8 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/Order'
+        '400':
+          description: Missing clientId (query or X-Client-Id header)
 
   /orders/{orderId}:
     get:
@@ -103,10 +118,15 @@ paths:
   /positions:
     get:
       summary: Get current positions for a client
+      description: Client can be provided via query ?clientId= or header X-Client-Id. Defaults to demo-client-1 if missing.
       parameters:
         - in: query
           name: clientId
-          required: true
+          schema:
+            type: string
+        - in: header
+          name: X-Client-Id
+          required: false
           schema:
             type: string
       responses:
@@ -119,6 +139,124 @@ paths:
                 items:
                   $ref: '#/components/schemas/Position'
 
+  /v1/dashboard:
+    get:
+      summary: Dashboard
+      description: Returns withdrawable balance and strategies for the client.
+      parameters:
+        - in: query
+          name: clientId
+          schema:
+            type: string
+        - in: header
+          name: X-Client-Id
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Dashboard
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Dashboard'
+
+  /v1/deposits:
+    get:
+      summary: List deposits
+      parameters:
+        - in: query
+          name: clientId
+          schema:
+            type: string
+        - in: header
+          name: X-Client-Id
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Deposits list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Deposit'
+    post:
+      summary: Create deposit
+      parameters:
+        - in: query
+          name: clientId
+          schema:
+            type: string
+        - in: header
+          name: X-Client-Id
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DepositCreate'
+      responses:
+        '200':
+          description: Deposit created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Deposit'
+
+  /v1/withdrawals:
+    get:
+      summary: List withdrawals
+      parameters:
+        - in: query
+          name: clientId
+          schema:
+            type: string
+        - in: header
+          name: X-Client-Id
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Withdrawals list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Withdrawal'
+    post:
+      summary: Create withdrawal
+      parameters:
+        - in: query
+          name: clientId
+          schema:
+            type: string
+        - in: header
+          name: X-Client-Id
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WithdrawalCreate'
+      responses:
+        '200':
+          description: Withdrawal created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Withdrawal'
+
 components:
 
   schemas:
@@ -126,7 +264,6 @@ components:
     OrderCreateRequest:
       type: object
       required:
-        - clientId
         - symbol
         - side
         - type
@@ -183,8 +320,13 @@ components:
             - CANCELED
         cumQty:
           type: number
+        filledQty:
+          type: number
         avgPx:
           type: number
+          nullable: true
+        rejectReason:
+          type: string
           nullable: true
         createdAt:
           type: string
@@ -204,3 +346,81 @@ components:
           type: number
         unrealizedPnl:
           type: number
+
+    Dashboard:
+      type: object
+      properties:
+        saldo_retirable:
+          type: number
+        estrategias:
+          type: array
+          items:
+            type: object
+
+    DepositCreate:
+      type: object
+      required:
+        - amount
+      properties:
+        amount:
+          type: number
+        currency:
+          type: string
+          default: USD
+        payment_method:
+          type: string
+          nullable: true
+        provider:
+          type: string
+          nullable: true
+        status:
+          type: string
+          default: completed
+
+    Deposit:
+      type: object
+      properties:
+        id:
+          type: string
+        amount:
+          type: number
+        currency:
+          type: string
+        payment_method:
+          type: string
+          nullable: true
+        provider:
+          type: string
+          nullable: true
+        status:
+          type: string
+        created_at:
+          type: string
+
+    WithdrawalCreate:
+      type: object
+      required:
+        - amount
+      properties:
+        amount:
+          type: number
+        currency:
+          type: string
+          default: USD
+        status:
+          type: string
+          default: completed
+
+    Withdrawal:
+      type: object
+      properties:
+        id:
+          type: string
+        amount:
+          type: number
+        currency:
+          type: string
+        status:
+          type: string
+        created_at:
+          type: string

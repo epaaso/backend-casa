@@ -8,6 +8,25 @@ from .events import SendOrderEvent, CancelOrderEvent
 # Fase 2.2 — EventBus y métricas
 from .event_bus import event_bus
 from .metrics import record
+from datetime import datetime
+
+
+def order_to_payload(order: OrderModel) -> dict:
+    return {
+        "id": order.id,
+        "clientId": order.client_id,
+        "symbol": order.symbol,
+        "side": order.side,
+        "type": order.type,
+        "qty": order.qty,
+        "price": order.price,
+        "status": order.status,
+        "filledQty": order.cum_qty,
+        "avgPx": order.avg_px,
+        "rejectReason": getattr(order, "reject_reason", None),
+        "createdAt": order.created_at.isoformat() if isinstance(order.created_at, datetime) else str(order.created_at),
+        "updatedAt": order.updated_at.isoformat() if isinstance(order.updated_at, datetime) else str(order.updated_at),
+    }
 
 
 class FixGateway:
@@ -70,10 +89,13 @@ class FixGateway:
             # 10% reject chance
             if random.random() < 0.1:
                 order.status = OrderStatus.REJECTED
+                if not getattr(order, "reject_reason", None):
+                    order.reject_reason = "FIX_REJECT"
                 db.add(order)
                 await db.commit()
                 print(f"[FIX] Order {order_id} → REJECTED")
                 self._publish_update(order)
+                self._publish_reject(order, code=order.reject_reason or "FIX_REJECT", message=order.reject_reason or "FIX_REJECT")
                 return
 
             # Simulate fill or partial fill
@@ -141,10 +163,21 @@ class FixGateway:
             f"orders.{order.client_id}",
             {
                 "type": "ORDER_UPDATE",
-                "orderId": order.id,
-                "status": order.status,
-                "cumQty": order.cum_qty,
-                "avgPx": order.avg_px,
+                "payload": order_to_payload(order),
+            },
+        )
+        record("fix_events_processed", 1)
+
+    def _publish_reject(self, order: OrderModel, code: str, message: str | None = None):
+        event_bus.publish(
+            f"orders.{order.client_id}",
+            {
+                "type": "ORDER_REJECT",
+                "payload": {
+                    "code": code,
+                    "message": message or code,
+                    "order": order_to_payload(order),
+                },
             },
         )
         record("fix_events_processed", 1)
