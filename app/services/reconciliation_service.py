@@ -35,13 +35,18 @@ async def reconcile_internal(db: AsyncSession) -> dict:
 
         qty = float(o.qty or 0.0)
         cum = float(o.cum_qty or 0.0)
-        st = OrderStatus(o.status)
-        if st == OrderStatus.FILLED and abs(cum - qty) > 1e-9:
-            inco_reasons.append("STATUS_FILLED_BUT_CUM_QTY_NE_QTY")
-        if st == OrderStatus.PARTIALLY_FILLED and (cum <= 0 or cum >= qty):
-            inco_reasons.append("STATUS_PARTIAL_INCONSISTENT")
-        if st != OrderStatus.FILLED and abs(cum - qty) <= 1e-9 and qty > 0:
-            inco_reasons.append("STATUS_NOT_FILLED_BUT_CUM_EQ_QTY")
+        st = None
+        try:
+            st = OrderStatus(o.status)
+        except Exception:
+            inco_reasons.append("UNKNOWN_STATUS")
+        if st is not None:
+            if st == OrderStatus.FILLED and abs(cum - qty) > 1e-9:
+                inco_reasons.append("STATUS_FILLED_BUT_CUM_QTY_NE_QTY")
+            if st == OrderStatus.PARTIALLY_FILLED and (cum <= 0 or cum >= qty):
+                inco_reasons.append("STATUS_PARTIAL_INCONSISTENT")
+            if st != OrderStatus.FILLED and abs(cum - qty) <= 1e-9 and qty > 0:
+                inco_reasons.append("STATUS_NOT_FILLED_BUT_CUM_EQ_QTY")
 
         if inco_reasons:
             orders_inconsistent.append({

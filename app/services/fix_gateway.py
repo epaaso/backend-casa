@@ -21,6 +21,7 @@ def order_to_payload(order: OrderModel) -> dict:
         "qty": order.qty,
         "price": order.price,
         "status": order.status,
+        "cumQty": order.cum_qty,
         "filledQty": order.cum_qty,
         "avgPx": order.avg_px,
         "rejectReason": getattr(order, "reject_reason", None),
@@ -106,8 +107,11 @@ class FixGateway:
             # First fill
             exec1 = Execution(order_id=order.id, exec_qty=lot1, exec_px=px)
             db.add(exec1)
-            order.cum_qty += lot1
-            order.avg_px = px if order.avg_px is None else (order.avg_px + px) / 2
+            prev_cum = order.cum_qty or 0
+            order.cum_qty = prev_cum + lot1
+            # Weighted average price: (old_avg*old_qty + px*exec_qty) / (old_qty + exec_qty)
+            denom = prev_cum + lot1
+            order.avg_px = (0 if denom == 0 else ((order.avg_px or 0) * prev_cum + px * lot1) / denom)
             order.status = (
                 OrderStatus.PARTIALLY_FILLED
                 if order.cum_qty < order.qty
@@ -124,8 +128,11 @@ class FixGateway:
                 lot2 = order.qty - order.cum_qty
                 exec2 = Execution(order_id=order.id, exec_qty=lot2, exec_px=px)
                 db.add(exec2)
-                order.cum_qty += lot2
-                order.avg_px = px if order.avg_px is None else (order.avg_px + px) / 2
+                prev_cum = order.cum_qty or 0
+                order.cum_qty = prev_cum + lot2
+                # Weighted average price for second fill
+                denom = prev_cum + lot2
+                order.avg_px = (0 if denom == 0 else ((order.avg_px or 0) * prev_cum + px * lot2) / denom)
                 order.status = OrderStatus.FILLED
                 db.add(order)
                 await db.commit()

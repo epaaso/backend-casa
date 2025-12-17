@@ -1,0 +1,2943 @@
+# Monolithic project bundle
+# Generated: 2025-12-17T00:21:49Z
+# Repo root: /Users/andrewshaw/PycharmProjects/Bakckend-Casa
+
+-----8<----- FILE: .gitignore (254 bytes) -----
+```
+# Python virtual environment
+.venv/
+venv/
+ENV/
+
+# Python compiled files and cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Database
+app.db
+*.sqlite3
+
+# Environment variables
+.env
+
+# IDE configuration
+.idea/
+.vscode/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+```
+-----8<----- END FILE: .gitignore -----
+
+-----8<----- FILE: app/__init__.py (26 bytes) -----
+```python
+# OMS Backend app package
+
+```
+-----8<----- END FILE: app/__init__.py -----
+
+-----8<----- FILE: app/api.py (9391 bytes) -----
+```python
+
+from types import SimpleNamespace
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Header
+from fastapi.responses import JSONResponse
+from sqlalchemy.ext.asyncio import AsyncSession
+from .db import get_session
+from .models import Order as OrderModel
+from .schemas import OrderCreateRequest, Order as OrderSchema, Position as PositionSchema, OrderAmendRequest
+from .repositories.orders import OrderRepository
+from .repositories.positions import PositionsRepository
+# Fase 2 imports
+from .repositories.risk_limits import RiskLimitsRepository
+from .services.risk_service import validate_order
+from .services.metrics import record, snapshot
+from .services.reconciliation_service import reconcile_internal
+from .utils.enums import OrderStatus, Side, OrderType, TimeInForce
+from .services.fix_gateway import fix_gateway
+from .services.event_bus import event_bus
+
+router = APIRouter()
+
+get_db = get_session
+
+
+@router.get("/health")
+def health():
+    return {"status": "OK"}
+
+
+@router.post("/orders", response_model=OrderSchema, status_code=201)
+async def create_order(payload: OrderCreateRequest, db: AsyncSession = Depends(get_db), x_client_id: str | None = Header(default=None, alias="X-Client-Id")):
+    """Create an order after pre-trade risk validation, persist it, commit so FIX worker can see it,
+    then enqueue FIX SEND event.
+
+    Contract: Always responds 201 with OrderSchema. If risk rejection occurs, the returned order will have
+    status=REJECTED and rejectReason set. The frontend must inspect 'status' to handle rejections.
+    """
+    # Resolver clientId (body -> header -> fallback)
+    resolved_client_id = payload.clientId or x_client_id or "demo-client-1"
+
+    # Fase 2.1 — Validación de riesgo
+    risk_repo = RiskLimitsRepository(db)
+    client_limit = await risk_repo.by_client_symbol(resolved_client_id, payload.symbol)
+    # Si no hay límites definidos para el cliente, definir unos permisivos por defecto para no bloquear MVP
+    if client_limit is None:
+        # 24x7, sin bloqueo ni límites muy restrictivos
+        client_limit = SimpleNamespace(
+            client_id=resolved_client_id,
+            symbol=None,
+            max_notional=1e12,
+            max_order_size=1e9,
+            trading_hours="00:00-23:59",
+            blocked=False,
+        )
+    # Especificación del símbolo (estático)
+    symbol_spec = {
+        "ref_price": 2000.0 if payload.symbol.upper().startswith("XAU") else 1.10
+    }
+
+    ok, reason = validate_order(payload, client_limit, symbol_spec)
+    if not ok:
+        # Métricas
+        record("orders_rejected", 1)
+        record(f"risk_rejects:{reason}", 1)
+        # Persist REJECTED order for audit/front/reconciliation
+        repo = OrderRepository(db)
+        order = await repo.create({
+            "client_id": resolved_client_id,
+            "symbol": payload.symbol,
+            "side": payload.side.value,
+            "type": payload.type.value,
+            "qty": payload.qty,
+            "price": payload.price,
+            "time_in_force": payload.timeInForce.value,
+            "status": OrderStatus.REJECTED.value,
+            "reject_reason": reason,
+        })
+        await db.commit()
+        # WS ORDER_REJECT with full order
+        fix_gateway._publish_reject(order, code=reason or "RISK_REJECT", message=reason or "RISK_REJECT")
+        # Respond with the rejected order object (align front expectations)
+        return to_schema(order)
+
+    # Fase 2.3 — métrica de orden aceptada
+    record("orders_total", 1)
+
+    repo = OrderRepository(db)
+
+    order = await repo.create({
+        "client_id": resolved_client_id,
+        "symbol": payload.symbol,
+        "side": payload.side.value,
+        "type": payload.type.value,
+        "qty": payload.qty,
+        "price": payload.price,
+        "time_in_force": payload.timeInForce.value,
+        "status": OrderStatus.NEW.value,
+    })
+
+    await db.commit()     # <<< CRITICAL FIX: allow worker thread to see the order
+
+    await fix_gateway.enqueue_send(order.id)
+
+    return to_schema(order)
+
+
+@router.get("/orders", response_model=list[OrderSchema])
+async def list_orders(
+    clientId: str | None = Query(default=None),
+    symbol: str | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+    x_client_id: str | None = Header(default=None, alias="X-Client-Id"),
+):
+    resolved_client_id = clientId or x_client_id or None
+    if resolved_client_id is None:
+        # Seguridad por defecto: requerir identidad del cliente para listar
+        # (puede venir por query ?clientId= o por header X-Client-Id)
+        raise HTTPException(status_code=400, detail="clientId is required (query or X-Client-Id header)")
+    repo = OrderRepository(db)
+    items = await repo.list(resolved_client_id, symbol)
+    return [to_schema(o) for o in items]
+
+
+@router.get("/orders/{orderId}", response_model=OrderSchema)
+async def get_order(orderId: str, db: AsyncSession = Depends(get_db)):
+    repo = OrderRepository(db)
+    order = await repo.get(orderId)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return to_schema(order)
+
+
+@router.post("/orders/{orderId}/cancel", response_model=OrderSchema)
+async def cancel_order(orderId: str, db: AsyncSession = Depends(get_db)):
+    """Commit DB before enqueueing FIX cancel event."""
+    repo = OrderRepository(db)
+
+    order = await repo.get(orderId)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    await db.commit()     # <<< CRITICAL FIX: persist order state before FIX cancel
+
+    await fix_gateway.enqueue_cancel(order.id)
+
+    return to_schema(order)
+
+
+@router.patch("/orders/{orderId}", response_model=OrderSchema)
+async def amend_order(orderId: str, payload: OrderAmendRequest, db: AsyncSession = Depends(get_db)):
+    repo = OrderRepository(db)
+    order = await repo.get(orderId)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    editable = {OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED}
+    if order.status not in editable:
+        raise HTTPException(status_code=400, detail=f"Order not editable in current status ({order.status}). Editable statuses: NEW, PARTIALLY_FILLED. Amend is not allowed in PENDING_SEND or SENT.")
+
+    if payload.qty is None and payload.price is None:
+        raise HTTPException(status_code=400, detail="No fields to amend")
+
+    if payload.qty is not None and payload.qty < order.cum_qty:
+        raise HTTPException(status_code=400, detail="qty cannot be less than filled quantity")
+
+    # Determine new values
+    new_qty = float(payload.qty) if payload.qty is not None else float(order.qty)
+    new_price = float(payload.price) if payload.price is not None else (float(order.price) if order.price is not None else None)
+
+    # Re-validate risk
+    risk_repo = RiskLimitsRepository(db)
+    client_limit = await risk_repo.by_client_symbol(order.client_id, order.symbol)
+    if client_limit is None:
+        client_limit = SimpleNamespace(
+            client_id=order.client_id,
+            symbol=None,
+            max_notional=1e12,
+            max_order_size=1e9,
+            trading_hours="00:00-23:59",
+            blocked=False,
+        )
+    symbol_spec = {"ref_price": 2000.0 if order.symbol.upper().startswith("XAU") else 1.10}
+
+    class Tmp:
+        def __init__(self, clientId, symbol, side, type, qty, price):
+            self.clientId = clientId
+            self.symbol = symbol
+            self.side = side
+            self.type = type
+            self.qty = qty
+            self.price = price
+            self.timeInForce = "GTC"
+
+    tmp = Tmp(order.client_id, order.symbol, order.side, order.type, new_qty, new_price)
+
+    ok, reason = validate_order(tmp, client_limit, symbol_spec)
+    if not ok:
+        raise HTTPException(status_code=400, detail=reason)
+
+    # Apply changes
+    if payload.price is not None:
+        order.price = payload.price
+    if payload.qty is not None:
+        order.qty = payload.qty
+
+    db.add(order)
+    await db.commit()
+
+    # Publish update via WS
+    fix_gateway._publish_update(order)
+
+    return to_schema(order)
+
+
+@router.get("/positions", response_model=list[PositionSchema])
+async def positions(
+    clientId: str | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+    x_client_id: str | None = Header(default=None, alias="X-Client-Id"),
+):
+    resolved = clientId or x_client_id or "demo-client-1"
+    repo = PositionsRepository(db)
+    items = await repo.by_client(resolved)
+    return [PositionSchema(**i) for i in items]
+
+
+# Fase 2.3 — Métricas
+@router.get("/metrics")
+def metrics():
+    return snapshot()
+
+# Fase 2.4 — Admin reconcile
+@router.get("/admin/reconcile/internal")
+async def admin_reconcile(db: AsyncSession = Depends(get_db)):
+    return await reconcile_internal(db)
+
+
+# --------------------------
+# Mapper DB → API Schema
+# --------------------------
+
+def to_schema(o: OrderModel) -> OrderSchema:
+    return OrderSchema(
+        id=o.id,
+        clientId=o.client_id,
+        symbol=o.symbol,
+        side=o.side,
+        type=o.type,
+        qty=o.qty,
+        price=o.price,
+        status=o.status,
+        cumQty=o.cum_qty,
+        filledQty=o.cum_qty,
+        avgPx=o.avg_px,
+        rejectReason=getattr(o, "reject_reason", None),
+        createdAt=o.created_at,
+        updatedAt=o.updated_at,
+    )
+
+```
+-----8<----- END FILE: app/api.py -----
+
+-----8<----- FILE: app/db.py (2946 bytes) -----
+```python
+import os
+
+from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+from sqlalchemy import text
+
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./app.db")
+
+engine = create_async_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False},
+    future=True,
+)
+AsyncSessionLocal = async_sessionmaker(
+    engine,
+    expire_on_commit=False,
+    class_=AsyncSession,
+)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+async def init_db():
+    """Create tables at startup using the async engine. Includes lightweight migrations for MVP."""
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        # Lightweight migration: add orders.reject_reason if missing (SQLite pragma-based check)
+        try:
+            res = await conn.execute(text("PRAGMA table_info(orders);"))
+            cols = [row[1] for row in res.fetchall()]
+            if "reject_reason" not in cols:
+                await conn.execute(text("ALTER TABLE orders ADD COLUMN reject_reason VARCHAR NULL;"))
+        except Exception as e:
+            # Ignore migration errors in MVP; table may not exist yet or DB may not support PRAGMA
+            print(f"[init_db] migration check failed or skipped: {e}")
+
+        # Lightweight migration: ensure deposit_intents columns exist (SQLite)
+        try:
+            res = await conn.execute(text("PRAGMA table_info(deposit_intents);"))
+            cols = [row[1] for row in res.fetchall()]
+            # Example future-proofing; uncomment if migrating existing DBs without drop
+            # expected_cols = {
+            #     "id", "client_id", "amount", "currency", "payment_method",
+            #     "provider", "provider_reference", "payment_url", "status",
+            #     "metadata", "confirmed_amount", "created_at", "updated_at"
+            # }
+            # for col in expected_cols - set(cols):
+            #     if col == "metadata":
+            #         await conn.execute(text("ALTER TABLE deposit_intents ADD COLUMN metadata JSON NULL;"))
+            #     elif col in ("confirmed_amount",):
+            #         await conn.execute(text("ALTER TABLE deposit_intents ADD COLUMN confirmed_amount FLOAT NULL;"))
+            #     elif col in ("provider", "provider_reference", "payment_url"):
+            #         await conn.execute(text(f"ALTER TABLE deposit_intents ADD COLUMN {col} VARCHAR NULL;"))
+            #     elif col in ("updated_at",):
+            #         await conn.execute(text("ALTER TABLE deposit_intents ADD COLUMN updated_at DATETIME NULL;"))
+            #     # other columns would require more complex migrations; for dev, prefer recreating DB
+        except Exception as e:
+            print(f"[init_db] deposit_intents migration skipped: {e}")
+
+
+async def get_session():
+    async with AsyncSessionLocal() as session:
+        yield session
+
+```
+-----8<----- END FILE: app/db.py -----
+
+-----8<----- FILE: app/main.py (935 bytes) -----
+```python
+import uvicorn
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from .api import router
+from .db import init_db
+from .services.fix_gateway import fix_gateway
+# Fase 2.2 — WS router
+from .ws import ws_router
+# Monolito v1 stubs
+from .v1.api import v1
+
+app = FastAPI(title="OMS Backend (MVP)")
+
+# CORS for local frontends
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Start FIX worker properly when FastAPI starts — THIS IS CRITICAL
+@app.on_event("startup")
+async def startup_event():
+    await init_db()
+    await fix_gateway.start()
+
+# Add API routes
+app.include_router(router)
+app.include_router(ws_router)
+app.include_router(v1)
+
+if __name__ == "__main__":
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+
+```
+-----8<----- END FILE: app/main.py -----
+
+-----8<----- FILE: app/models.py (8707 bytes) -----
+```python
+import uuid
+from datetime import datetime
+from sqlalchemy import String, Float, DateTime, ForeignKey, Boolean, JSON, UniqueConstraint
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from .db import Base
+
+# ------------------------------
+# Fase 2 — Nuevos modelos
+# ------------------------------
+
+class Order(Base):
+    __tablename__ = "orders"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    client_id: Mapped[str] = mapped_column(String, index=True)
+    symbol: Mapped[str] = mapped_column(String, index=True)
+    side: Mapped[str] = mapped_column(String)
+    type: Mapped[str] = mapped_column(String)
+    qty: Mapped[float] = mapped_column(Float)
+    price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    time_in_force: Mapped[str] = mapped_column(String, default="GTC")
+
+    status: Mapped[str] = mapped_column(String, default="NEW", index=True)
+    cum_qty: Mapped[float] = mapped_column(Float, default=0.0)
+    avg_px: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reject_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    executions: Mapped[list["Execution"]] = relationship("Execution", back_populates="order", cascade="all, delete-orphan")
+
+class Execution(Base):
+    __tablename__ = "executions"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    order_id: Mapped[str] = mapped_column(String, ForeignKey("orders.id", ondelete="CASCADE"), index=True)
+    exec_qty: Mapped[float] = mapped_column(Float)
+    exec_px: Mapped[float] = mapped_column(Float)
+    exec_time: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    order: Mapped[Order] = relationship("Order", back_populates="executions")
+
+# Fase 2.1 — Tabla de límites de riesgo
+class RiskLimit(Base):
+    __tablename__ = "risk_limits"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    client_id: Mapped[str] = mapped_column(String, index=True)
+    symbol: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    max_notional: Mapped[float] = mapped_column(Float)
+    max_order_size: Mapped[float] = mapped_column(Float)
+    trading_hours: Mapped[str] = mapped_column(String)  # formato "HH:MM-HH:MM"
+    blocked: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+# ------------------------------
+# Fase 3 — Ledger mínimo (Deposits/Withdrawals)
+# ------------------------------
+class Deposit(Base):
+    __tablename__ = "deposits"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    client_id: Mapped[str] = mapped_column(String, index=True)
+    amount: Mapped[float] = mapped_column(Float)
+    currency: Mapped[str] = mapped_column(String, default="USD")
+    payment_method: Mapped[str | None] = mapped_column(String, nullable=True)
+    provider: Mapped[str | None] = mapped_column(String, nullable=True)
+    status: Mapped[str] = mapped_column(String, default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class Withdrawal(Base):
+    __tablename__ = "withdrawals"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    client_id: Mapped[str] = mapped_column(String, index=True)
+    amount: Mapped[float] = mapped_column(Float)
+    currency: Mapped[str] = mapped_column(String, default="USD")
+    status: Mapped[str] = mapped_column(String, default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class WithdrawalRequest(Base):
+    __tablename__ = "withdrawal_requests"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+
+    # En tu backend no hay user_id. Usamos client_id (equivalente al "owner").
+    client_id: Mapped[str] = mapped_column(String, index=True)
+
+    # inversión relacionada (opcional)
+    investment_id: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    amount: Mapped[float] = mapped_column(Float)
+    currency: Mapped[str] = mapped_column(String, default="USD")
+
+    bank_code: Mapped[str | None] = mapped_column(String, nullable=True)
+    bank_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    account_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    clabe: Mapped[str | None] = mapped_column(String, nullable=True)
+    account_holder: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    email: Mapped[str | None] = mapped_column(String, nullable=True)
+    phone: Mapped[str | None] = mapped_column(String, nullable=True)
+    concept: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    status: Mapped[str] = mapped_column(String, default="pending_review", index=True)
+
+    preview_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    # Igual que el ejemplo: columna en DB se llama "metadata", atributo en modelo metadata_
+    metadata_: Mapped[dict | None] = mapped_column("metadata", JSON, nullable=True)
+
+    reviewed_by: Mapped[str | None] = mapped_column(String, nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# ------------------------------
+# Deposit Intents (for payments)
+# ------------------------------
+class DepositIntent(Base):
+    __tablename__ = "deposit_intents"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    client_id: Mapped[str] = mapped_column(String, index=True)
+
+    amount: Mapped[float] = mapped_column(Float)
+    currency: Mapped[str] = mapped_column(String, default="USD")
+    payment_method: Mapped[str] = mapped_column(String, default="card")
+
+    provider: Mapped[str | None] = mapped_column(String, nullable=True)
+    provider_reference: Mapped[str | None] = mapped_column(String, nullable=True)  # Stripe session id
+    payment_url: Mapped[str | None] = mapped_column(String, nullable=True)         # Stripe checkout url
+
+    status: Mapped[str] = mapped_column(String, default="pending", index=True)
+
+    metadata_: Mapped[dict | None] = mapped_column("metadata", JSON, nullable=True)
+    confirmed_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# ------------------------------
+# KYC Models
+# ------------------------------
+class KYCVerification(Base):
+    __tablename__ = "kyc_verifications"
+    __table_args__ = (UniqueConstraint("session_id", name="uq_kyc_verifications_session"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+
+    # owner por client_id
+    client_id: Mapped[str] = mapped_column(String, index=True)
+
+    session_id: Mapped[str] = mapped_column(String, nullable=False)
+    provider: Mapped[str] = mapped_column(String, nullable=False)
+
+    status: Mapped[str] = mapped_column(String, default="pending", index=True)
+    verification_level: Mapped[str | None] = mapped_column(String, nullable=True)
+    reason: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    provider_data: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    document_types: Mapped[list | None] = mapped_column(JSON, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class KYCWebhookEvent(Base):
+    __tablename__ = "kyc_webhook_events"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+
+    kyc_verification_id: Mapped[str] = mapped_column(String, ForeignKey("kyc_verifications.id", ondelete="CASCADE"), index=True)
+
+    event_type: Mapped[str] = mapped_column(String, nullable=True)
+    raw_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+
+    processed: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+```
+-----8<----- END FILE: app/models.py -----
+
+-----8<----- FILE: app/repositories/orders.py (1123 bytes) -----
+```python
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from ..models import Order as OrderModel
+from ..utils.enums import OrderStatus
+
+class OrderRepository:
+    def __init__(self, db: AsyncSession):
+        self.db = db
+
+    async def create(self, data: dict) -> OrderModel:
+        order = OrderModel(**data)
+        self.db.add(order)
+        await self.db.flush()  # assign id
+        return order
+
+    async def get(self, order_id: str) -> OrderModel | None:
+        return await self.db.get(OrderModel, order_id)
+
+    async def list(self, client_id: str | None, symbol: str | None) -> list[OrderModel]:
+        stmt = select(OrderModel)
+        if client_id:
+            stmt = stmt.where(OrderModel.client_id == client_id)
+        if symbol:
+            stmt = stmt.where(OrderModel.symbol == symbol)
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())
+
+    async def save(self, order: OrderModel):
+        self.db.add(order)
+
+    async def set_status(self, order: OrderModel, status: OrderStatus):
+        order.status = status
+        self.db.add(order)
+
+```
+-----8<----- END FILE: app/repositories/orders.py -----
+
+-----8<----- FILE: app/repositories/positions.py (1407 bytes) -----
+```python
+from sqlalchemy import select, func, case
+from sqlalchemy.ext.asyncio import AsyncSession
+from ..models import Order, Execution
+
+class PositionsRepository:
+    def __init__(self, db: AsyncSession):
+        self.db = db
+
+    async def by_client(self, client_id: str) -> list[dict]:
+        signed_qty = case(
+            (Order.side == "BUY", Execution.exec_qty),
+            else_=-Execution.exec_qty,
+        )
+        sub = (
+            select(
+                Order.client_id.label("clientId"),
+                Order.symbol.label("symbol"),
+                func.sum(signed_qty).label("netQty"),
+                (
+                    func.sum(Execution.exec_qty * Execution.exec_px)
+                    / func.nullif(func.sum(Execution.exec_qty), 0)
+                ).label("avgPx"),
+            )
+            .join(Execution, Execution.order_id == Order.id)
+            .where(Order.client_id == client_id)
+            .group_by(Order.client_id, Order.symbol)
+        )
+        rows = (await self.db.execute(sub)).all()
+        positions = []
+        for r in rows:
+            net_qty = float(r.netQty or 0)
+            avg_px = float(r.avgPx or 0)
+            positions.append({
+                "clientId": r.clientId,
+                "symbol": r.symbol,
+                "netQty": net_qty,
+                "avgPx": avg_px,
+                "unrealizedPnl": 0.0,
+            })
+        return positions
+
+```
+-----8<----- END FILE: app/repositories/positions.py -----
+
+-----8<----- FILE: app/repositories/risk_limits.py (1656 bytes) -----
+```python
+from typing import Optional
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from ..models import RiskLimit
+
+# Fase 2.1 — Repositorio CRUD para risk_limits (async)
+class RiskLimitsRepository:
+    def __init__(self, db: AsyncSession):
+        self.db = db
+
+    async def create(self, data: dict) -> RiskLimit:
+        item = RiskLimit(**data)
+        self.db.add(item)
+        await self.db.flush()
+        return item
+
+    async def get(self, id_: str) -> Optional[RiskLimit]:
+        return await self.db.get(RiskLimit, id_)
+
+    async def list(self, client_id: Optional[str] = None, symbol: Optional[str] = None) -> list[RiskLimit]:
+        stmt = select(RiskLimit)
+        if client_id is not None:
+            stmt = stmt.where(RiskLimit.client_id == client_id)
+        if symbol is not None:
+            stmt = stmt.where(RiskLimit.symbol == symbol)
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())
+
+    async def by_client_symbol(self, client_id: str, symbol: str) -> Optional[RiskLimit]:
+        """Preferir un límite específico por símbolo; si no hay, usar el general (symbol IS NULL)."""
+        stmt_specific = select(RiskLimit).where(
+            RiskLimit.client_id == client_id,
+            RiskLimit.symbol == symbol,
+        )
+        specific = (await self.db.execute(stmt_specific)).scalars().first()
+        if specific:
+            return specific
+        stmt_general = select(RiskLimit).where(
+            RiskLimit.client_id == client_id,
+            RiskLimit.symbol.is_(None),
+        )
+        return (await self.db.execute(stmt_general)).scalars().first()
+
+```
+-----8<----- END FILE: app/repositories/risk_limits.py -----
+
+-----8<----- FILE: app/schemas.py (1436 bytes) -----
+```python
+from datetime import datetime
+from pydantic import BaseModel, Field, field_validator
+from typing import Optional
+from .utils.enums import Side, OrderType, TimeInForce, OrderStatus
+
+class OrderCreateRequest(BaseModel):
+    clientId: Optional[str] = None
+    symbol: str
+    side: Side
+    type: OrderType
+    qty: float = Field(gt=0)
+    price: Optional[float] = None
+    timeInForce: TimeInForce = TimeInForce.GTC
+
+    @field_validator("price")
+    @classmethod
+    def validate_price(cls, v, info):
+        values = info.data
+        otype = values.get("type")
+        if otype == OrderType.LIMIT and v is None:
+            raise ValueError("price is required for LIMIT orders")
+        if otype == OrderType.MARKET and v is not None:
+            raise ValueError("price must be null for MARKET orders")
+        return v
+
+class Order(BaseModel):
+    id: str
+    clientId: str
+    symbol: str
+    side: Side
+    type: OrderType
+    qty: float
+    price: Optional[float] = None
+    status: OrderStatus
+    cumQty: float
+    filledQty: float
+    avgPx: Optional[float] = None
+    rejectReason: Optional[str] = None
+    createdAt: datetime
+    updatedAt: datetime
+
+    class Config:
+        from_attributes = True
+
+class OrderAmendRequest(BaseModel):
+    price: Optional[float] = None
+    qty: Optional[float] = None
+
+class Position(BaseModel):
+    clientId: str
+    symbol: str
+    netQty: float
+    avgPx: float
+    unrealizedPnl: float
+
+```
+-----8<----- END FILE: app/schemas.py -----
+
+-----8<----- FILE: app/services/event_bus.py (1667 bytes) -----
+```python
+from collections import defaultdict
+from threading import Lock
+from typing import Callable, Any, Dict, List
+
+# Fase 2.2 — Event Bus in-memory (thread-safe básico)
+
+class EventBus:
+    def __init__(self):
+        self.subscribers: Dict[str, List[Callable[[Any], None]]] = defaultdict(list)
+        self._lock = Lock()
+
+    def subscribe(self, topic: str, callback: Callable[[Any], None]) -> Callable[[], None]:
+        """Suscribe un callback sincrónico que recibirá `event` y devuelve una función `unsubscribe()`.
+        """
+        with self._lock:
+            self.subscribers[topic].append(callback)
+        return lambda: self._unsubscribe(topic, callback)
+
+    def _unsubscribe(self, topic: str, callback: Callable[[Any], None]) -> None:
+        """Remueve el callback del tópico si existe (idempotente)."""
+        with self._lock:
+            cbs = self.subscribers.get(topic)
+            if not cbs:
+                return
+            try:
+                cbs.remove(callback)
+            except ValueError:
+                pass
+            if not cbs:
+                # limpiar lista vacía
+                self.subscribers.pop(topic, None)
+
+    def publish(self, topic: str, event: Any) -> None:
+        # Copiar lista bajo lock para evitar problemas si cambian durante iteración
+        with self._lock:
+            callbacks = list(self.subscribers.get(topic, []))
+        for cb in callbacks:
+            try:
+                cb(event)
+            except Exception as ex:
+                # Evitar que un callback rompa a los demás
+                print(f"[EventBus] callback error on {topic}: {ex}")
+
+
+# Instancia global
+event_bus = EventBus()
+
+```
+-----8<----- END FILE: app/services/event_bus.py -----
+
+-----8<----- FILE: app/services/events.py (140 bytes) -----
+```python
+from dataclasses import dataclass
+
+@dataclass
+class SendOrderEvent:
+    order_id: str
+
+@dataclass
+class CancelOrderEvent:
+    order_id: str
+
+```
+-----8<----- END FILE: app/services/events.py -----
+
+-----8<----- FILE: app/services/fix_gateway.py (7263 bytes) -----
+```python
+import asyncio
+import random
+from typing import Optional
+from ..db import AsyncSessionLocal
+from ..models import Order as OrderModel, Execution
+from ..utils.enums import OrderStatus
+from .events import SendOrderEvent, CancelOrderEvent
+# Fase 2.2 — EventBus y métricas
+from .event_bus import event_bus
+from .metrics import record
+from datetime import datetime
+
+
+def order_to_payload(order: OrderModel) -> dict:
+    return {
+        "id": order.id,
+        "clientId": order.client_id,
+        "symbol": order.symbol,
+        "side": order.side,
+        "type": order.type,
+        "qty": order.qty,
+        "price": order.price,
+        "status": order.status,
+        "cumQty": order.cum_qty,
+        "filledQty": order.cum_qty,
+        "avgPx": order.avg_px,
+        "rejectReason": getattr(order, "reject_reason", None),
+        "createdAt": order.created_at.isoformat() if isinstance(order.created_at, datetime) else str(order.created_at),
+        "updatedAt": order.updated_at.isoformat() if isinstance(order.updated_at, datetime) else str(order.updated_at),
+    }
+
+
+class FixGateway:
+    def __init__(self):
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.worker_task: Optional[asyncio.Task] = None
+
+    async def start(self):
+        """Start the FIX worker task once FastAPI starts."""
+        if self.worker_task is None or self.worker_task.done():
+            print("Starting FIX worker task...")
+            self.worker_task = asyncio.create_task(self._worker())
+
+    async def enqueue_send(self, order_id: str):
+        print(f"[FIX] Enqueued SEND {order_id}")
+        await self.queue.put(SendOrderEvent(order_id))
+
+    async def enqueue_cancel(self, order_id: str):
+        print(f"[FIX] Enqueued CANCEL {order_id}")
+        await self.queue.put(CancelOrderEvent(order_id))
+
+    async def _worker(self):
+        print("FIX worker STARTED")
+        while True:
+            evt = await self.queue.get()
+            try:
+                if isinstance(evt, SendOrderEvent):
+                    await self._process_send(evt.order_id)
+                elif isinstance(evt, CancelOrderEvent):
+                    await self._process_cancel(evt.order_id)
+            finally:
+                self.queue.task_done()
+
+    async def _process_send(self, order_id: str):
+        async with AsyncSessionLocal() as db:
+            order = await db.get(OrderModel, order_id)
+            if not order:
+                print(f"[FIX] Order NOT FOUND: {order_id}")
+                return
+
+            # Move to PENDING_SEND
+            order.status = OrderStatus.PENDING_SEND
+            db.add(order)
+            await db.commit()
+            print(f"[FIX] Order {order_id} → PENDING_SEND")
+            self._publish_update(order)
+
+            await asyncio.sleep(0.2)  # simulate delay
+            order.status = OrderStatus.SENT
+            db.add(order)
+            await db.commit()
+            print(f"[FIX] Order {order_id} → SENT")
+            self._publish_update(order)
+
+            # Process fills
+            remaining = order.qty - order.cum_qty
+            if remaining <= 0:
+                return
+
+            # 10% reject chance
+            if random.random() < 0.1:
+                order.status = OrderStatus.REJECTED
+                if not getattr(order, "reject_reason", None):
+                    order.reject_reason = "FIX_REJECT"
+                db.add(order)
+                await db.commit()
+                print(f"[FIX] Order {order_id} → REJECTED")
+                self._publish_update(order)
+                self._publish_reject(order, code=order.reject_reason or "FIX_REJECT", message=order.reject_reason or "FIX_REJECT")
+                return
+
+            # Simulate fill or partial fill
+            partial = random.random() < 0.5
+            lot1 = remaining * (0.4 if partial else 1.0)
+            px = order.price or self._mock_market_px(order.symbol)
+
+            # First fill
+            exec1 = Execution(order_id=order.id, exec_qty=lot1, exec_px=px)
+            db.add(exec1)
+            prev_cum = order.cum_qty or 0
+            order.cum_qty = prev_cum + lot1
+            # Weighted average price: (old_avg*old_qty + px*exec_qty) / (old_qty + exec_qty)
+            denom = prev_cum + lot1
+            order.avg_px = (0 if denom == 0 else ((order.avg_px or 0) * prev_cum + px * lot1) / denom)
+            order.status = (
+                OrderStatus.PARTIALLY_FILLED
+                if order.cum_qty < order.qty
+                else OrderStatus.FILLED
+            )
+            db.add(order)
+            await db.commit()
+            print(f"[FIX] Order {order_id} filled {lot1} @ {px}")
+            self._publish_update(order)
+
+            # If partial, finish later
+            if order.cum_qty < order.qty:
+                await asyncio.sleep(0.3)
+                lot2 = order.qty - order.cum_qty
+                exec2 = Execution(order_id=order.id, exec_qty=lot2, exec_px=px)
+                db.add(exec2)
+                prev_cum = order.cum_qty or 0
+                order.cum_qty = prev_cum + lot2
+                # Weighted average price for second fill
+                denom = prev_cum + lot2
+                order.avg_px = (0 if denom == 0 else ((order.avg_px or 0) * prev_cum + px * lot2) / denom)
+                order.status = OrderStatus.FILLED
+                db.add(order)
+                await db.commit()
+                print(f"[FIX] Order {order_id} final fill {lot2} @ {px}")
+                self._publish_update(order)
+
+    async def _process_cancel(self, order_id: str):
+        async with AsyncSessionLocal() as db:
+            order = await db.get(OrderModel, order_id)
+            if not order:
+                print(f"[FIX] Cancel ignored: Order not found {order_id}")
+                return
+
+            if order.status in (
+                OrderStatus.FILLED,
+                OrderStatus.CANCELED,
+                OrderStatus.REJECTED,
+            ):
+                print(f"[FIX] Cancel ignored: Order {order_id} already terminal")
+                return
+
+            await asyncio.sleep(0.2)
+            order.status = OrderStatus.CANCELED
+            db.add(order)
+            await db.commit()
+            print(f"[FIX] Order {order_id} → CANCELED")
+            self._publish_update(order)
+
+    def _mock_market_px(self, symbol: str) -> float:
+        base = 2000.0 if symbol.upper().startswith("XAU") else 1.1000
+        return round(base + random.uniform(-1, 1), 2)
+
+    def _publish_update(self, order: OrderModel):
+        event_bus.publish(
+            f"orders.{order.client_id}",
+            {
+                "type": "ORDER_UPDATE",
+                "payload": order_to_payload(order),
+            },
+        )
+        record("fix_events_processed", 1)
+
+    def _publish_reject(self, order: OrderModel, code: str, message: str | None = None):
+        event_bus.publish(
+            f"orders.{order.client_id}",
+            {
+                "type": "ORDER_REJECT",
+                "payload": {
+                    "code": code,
+                    "message": message or code,
+                    "order": order_to_payload(order),
+                },
+            },
+        )
+        record("fix_events_processed", 1)
+
+
+# Global instance
+fix_gateway = FixGateway()
+
+```
+-----8<----- END FILE: app/services/fix_gateway.py -----
+
+-----8<----- FILE: app/services/kyc_providers/base.py (650 bytes) -----
+```python
+from abc import ABC, abstractmethod
+from typing import Dict, Any
+
+
+class KYCProvider(ABC):
+    @abstractmethod
+    async def create_applicant(self, *, client_id: str, user_data: dict) -> Dict[str, Any]:
+        pass
+
+    @abstractmethod
+    async def get_access_token(self, applicant_id: str) -> str:
+        pass
+
+    @abstractmethod
+    async def get_applicant_status(self, applicant_id: str) -> Dict[str, Any]:
+        pass
+
+    @abstractmethod
+    async def process_webhook(self, payload: dict) -> Dict[str, Any]:
+        """Return normalized: { session_id, status, reason?, provider_data?, verification_level?, document_types? }"""
+        pass
+
+```
+-----8<----- END FILE: app/services/kyc_providers/base.py -----
+
+-----8<----- FILE: app/services/kyc_providers/factory.py (420 bytes) -----
+```python
+import os
+from .mock import MockKYCProvider
+from .sumsub import SumsubKYCProvider
+
+
+def get_kyc_provider(name: str):
+    name = (name or "sumsub").lower()
+    debug = os.getenv("DEBUG", "0") == "1" or os.getenv("TESTING", "0") == "1"
+    if name in ("mock", "mock_sumsub") or debug:
+        return MockKYCProvider()
+    if name == "sumsub":
+        return SumsubKYCProvider()
+    # fallback
+    return MockKYCProvider()
+
+```
+-----8<----- END FILE: app/services/kyc_providers/factory.py -----
+
+-----8<----- FILE: app/services/kyc_providers/mock.py (1311 bytes) -----
+```python
+import uuid
+from datetime import datetime, timezone
+from ...utils.enums import KYCStatus
+from .base import KYCProvider
+
+
+class MockKYCProvider(KYCProvider):
+    async def create_applicant(self, *, client_id: str, user_data: dict):
+        return {"applicantId": f"mock_{uuid.uuid4()}", "createdAt": datetime.now(timezone.utc).isoformat()}
+
+    async def get_access_token(self, applicant_id: str) -> str:
+        return f"mock_token_{applicant_id}"
+
+    async def get_applicant_status(self, applicant_id: str):
+        return {"reviewStatus": "pending"}
+
+    async def process_webhook(self, payload: dict):
+        # Accept payload similar to Sumsub test
+        review_status = payload.get("reviewStatus") or payload.get("review", {}).get("reviewStatus") or "pending"
+        mapping = {
+            "completed": KYCStatus.APPROVED.value,
+            "pending": KYCStatus.PENDING.value,
+            "queued": KYCStatus.PENDING.value,
+            "rejected": KYCStatus.REJECTED.value,
+            "onHold": KYCStatus.PENDING.value,
+        }
+        return {
+            "session_id": payload.get("applicantId") or payload.get("applicant_id"),
+            "status": mapping.get(review_status, KYCStatus.PENDING.value),
+            "reason": payload.get("reason"),
+            "provider_data": payload,
+        }
+
+```
+-----8<----- END FILE: app/services/kyc_providers/mock.py -----
+
+-----8<----- FILE: app/services/kyc_providers/sumsub.py (1801 bytes) -----
+```python
+import uuid
+from ...utils.enums import KYCStatus
+from .base import KYCProvider
+
+
+class SumsubKYCProvider(KYCProvider):
+    """Minimal Sumsub-like provider for structure compatibility.
+
+    For MVP, we don't call external APIs; we simulate responses and rely on webhook to update status.
+    In production, replace methods to perform real HTTP requests and signature validation as needed.
+    """
+
+    async def create_applicant(self, *, client_id: str, user_data: dict):
+        # Simulate Sumsub applicant creation
+        return {"applicantId": f"sumsub_{uuid.uuid4()}"}
+
+    async def get_access_token(self, applicant_id: str) -> str:
+        # Simulate access token (SDK)
+        return f"sumsub_token_{applicant_id}"
+
+    async def get_applicant_status(self, applicant_id: str):
+        # Default pending until webhook updates
+        return {"reviewStatus": "pending"}
+
+    async def process_webhook(self, payload: dict):
+        review = payload.get("review") or {}
+        review_status = payload.get("reviewStatus") or review.get("reviewStatus") or "pending"
+        reason = review.get("moderationComment") or payload.get("reason")
+        mapping = {
+            "completed": KYCStatus.APPROVED.value,
+            "pending": KYCStatus.PENDING.value,
+            "queued": KYCStatus.PENDING.value,
+            "rejected": KYCStatus.REJECTED.value,
+            "onHold": KYCStatus.PENDING.value,
+            "finalRejected": KYCStatus.REJECTED.value,
+            "expired": KYCStatus.EXPIRED.value,
+        }
+        return {
+            "session_id": payload.get("applicantId") or payload.get("applicant_id") or payload.get("applicant"),
+            "status": mapping.get(review_status, KYCStatus.PENDING.value),
+            "reason": reason,
+            "provider_data": payload,
+        }
+
+```
+-----8<----- END FILE: app/services/kyc_providers/sumsub.py -----
+
+-----8<----- FILE: app/services/metrics.py (948 bytes) -----
+```python
+from collections import defaultdict
+from typing import Dict, Any
+
+# Fase 2.3 — Métricas básicas (in-memory)
+
+_orders_total = 0
+_orders_rejected = 0
+_risk_rejects: Dict[str, int] = defaultdict(int)
+_fix_events_processed = 0
+
+
+def record(metric_name: str, value: int = 1):
+    global _orders_total, _orders_rejected, _fix_events_processed
+    if metric_name == "orders_total":
+        _orders_total += value
+    elif metric_name == "orders_rejected":
+        _orders_rejected += value
+    elif metric_name.startswith("risk_rejects:"):
+        reason = metric_name.split(":", 1)[1]
+        _risk_rejects[reason] += value
+    elif metric_name == "fix_events_processed":
+        _fix_events_processed += value
+
+
+def snapshot() -> dict[str, Any]:
+    return {
+        "orders_total": _orders_total,
+        "orders_rejected": _orders_rejected,
+        "risk_rejects": dict(_risk_rejects),
+        "fix_events_processed": _fix_events_processed,
+    }
+
+```
+-----8<----- END FILE: app/services/metrics.py -----
+
+-----8<----- FILE: app/services/reconciliation_service.py (3528 bytes) -----
+```python
+from collections import defaultdict
+from typing import List
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func
+from ..models import Order, Execution
+from ..repositories.positions import PositionsRepository
+from ..utils.enums import OrderStatus
+
+# Fase 2.4 — Reconciliación interna (async)
+
+async def reconcile_internal(db: AsyncSession) -> dict:
+    """
+    Verifica:
+      - order.cum_qty == sum(executions)
+      - status es coherente con qty y cum_qty
+      - positions coinciden con executions
+    Retorna dict con inconsistencias.
+    """
+    orders_inconsistent: List[dict] = []
+
+    stmt_exec_sums = (
+        select(Execution.order_id, func.sum(Execution.exec_qty).label("sum_exec"))
+        .group_by(Execution.order_id)
+    )
+    exec_rows = await db.execute(stmt_exec_sums)
+    exec_sums = {row.order_id: float(row.sum_exec or 0.0) for row in exec_rows}
+
+    orders_result = await db.execute(select(Order))
+    orders = orders_result.scalars().all()
+    for o in orders:
+        s = float(exec_sums.get(o.id, 0.0))
+        inco_reasons: List[str] = []
+        if abs((o.cum_qty or 0.0) - s) > 1e-9:
+            inco_reasons.append("CUM_QTY_MISMATCH")
+
+        qty = float(o.qty or 0.0)
+        cum = float(o.cum_qty or 0.0)
+        st = None
+        try:
+            st = OrderStatus(o.status)
+        except Exception:
+            inco_reasons.append("UNKNOWN_STATUS")
+        if st is not None:
+            if st == OrderStatus.FILLED and abs(cum - qty) > 1e-9:
+                inco_reasons.append("STATUS_FILLED_BUT_CUM_QTY_NE_QTY")
+            if st == OrderStatus.PARTIALLY_FILLED and (cum <= 0 or cum >= qty):
+                inco_reasons.append("STATUS_PARTIAL_INCONSISTENT")
+            if st != OrderStatus.FILLED and abs(cum - qty) <= 1e-9 and qty > 0:
+                inco_reasons.append("STATUS_NOT_FILLED_BUT_CUM_EQ_QTY")
+
+        if inco_reasons:
+            orders_inconsistent.append({
+                "orderId": o.id,
+                "status": o.status,
+                "qty": qty,
+                "cumQty": cum,
+                "reasons": inco_reasons,
+            })
+
+    stmt_exec_detail = select(
+        Order.client_id, Order.symbol, Order.side, Execution.exec_qty, Execution.exec_px
+    ).join(Execution, Execution.order_id == Order.id)
+    rows = (await db.execute(stmt_exec_detail)).all()
+
+    agg = defaultdict(float)
+    for r in rows:
+        sign = 1.0 if r.side == "BUY" else -1.0
+        agg[(r.client_id, r.symbol)] += sign * float(r.exec_qty)
+
+    positions_inconsistent: List[dict] = []
+    repo = PositionsRepository(db)
+    clients = {cid for (cid, _sym) in agg.keys()}
+    for cid in clients:
+        calc = {(cid, sym): qty for (cid2, sym), qty in agg.items() if cid2 == cid}
+        repolist = await repo.by_client(cid)
+        repo_map = {(p["clientId"], p["symbol"]): float(p["netQty"]) for p in repolist}
+        keys = set(calc.keys()) | set(repo_map.keys())
+        for key in keys:
+            a = float(calc.get(key, 0.0))
+            b = float(repo_map.get(key, 0.0))
+            if abs(a - b) > 1e-9:
+                positions_inconsistent.append({
+                    "clientId": key[0],
+                    "symbol": key[1],
+                    "calcNetQty": a,
+                    "repoNetQty": b,
+                })
+
+    ok = not orders_inconsistent and not positions_inconsistent
+    return {
+        "ok": ok,
+        "orders_inconsistent": orders_inconsistent,
+        "positions_inconsistent": positions_inconsistent,
+    }
+
+```
+-----8<----- END FILE: app/services/reconciliation_service.py -----
+
+-----8<----- FILE: app/services/risk_service.py (2815 bytes) -----
+```python
+from datetime import datetime, time as time_cls
+from typing import Any, Tuple
+
+# Fase 2.1 — Servicio de riesgo (pre-trade)
+
+
+def _parse_trading_hours(th: str) -> tuple[datetime, datetime] | tuple[time_cls, time_cls]:
+    """Parsea string "HH:MM-HH:MM" a tupla de times.
+    No gestiona spans de día (e.g., 22:00-02:00) para mantenerlo simple MVP.
+    """
+    try:
+        start_s, end_s = th.split("-")
+        sh, sm = [int(x) for x in start_s.split(":")]
+        eh, em = [int(x) for x in end_s.split(":")]
+        return time_cls(sh, sm), time_cls(eh, em)
+    except Exception:
+        # si formato inválido, forzar rechazo por seguridad
+        return time_cls(23, 59), time_cls(0, 0)
+
+
+def validate_order(order_request: Any, client_risk: Any, symbol_spec: dict) -> Tuple[bool, str | None]:
+    """
+    Valida un request de orden contra límites de riesgo y especificación del símbolo.
+    Reglas:
+      - qty > 0
+      - si type == LIMIT → price requerido
+      - si type == MARKET → price debe ser None
+      - notional = qty * price (si MARKET usar precio de referencia del symbol_spec)
+      - notional <= max_notional
+      - qty <= max_order_size
+      - hora actual ∈ trading_hours (string tipo "09:00-16:00")
+      - símbolo no bloqueado
+    Retorna (ok, reason) donde reason es un string con la causa del rechazo.
+    """
+    # qty > 0
+    qty = float(order_request.qty)
+    if qty <= 0:
+        return False, "INVALID_QTY"
+
+    otype = getattr(order_request, "type")
+    price = getattr(order_request, "price", None)
+
+    # coherencia de precio según tipo
+    if str(otype) in ("OrderType.LIMIT", "LIMIT"):
+        if price is None:
+            return False, "PRICE_REQUIRED"
+    if str(otype) in ("OrderType.MARKET", "MARKET"):
+        if price is not None:
+            return False, "PRICE_NOT_ALLOWED"
+
+    # símbolo bloqueado
+    if getattr(client_risk, "blocked", False):
+        return False, "SYMBOL_BLOCKED"
+
+    # horario de trading
+    th = getattr(client_risk, "trading_hours", "00:00-23:59")
+    start_t, end_t = _parse_trading_hours(th)
+    now_t = datetime.now().time()
+    if not (start_t <= now_t <= end_t):
+        return False, "OUTSIDE_TRADING_HOURS"
+
+    # notional
+    if price is None:
+        ref_px = symbol_spec.get("ref_price")
+        try:
+            price = float(ref_px)
+        except Exception:
+            return False, "MISSING_REFERENCE_PRICE"
+    notional = qty * float(price)
+    max_notional = float(getattr(client_risk, "max_notional", float("inf")))
+    if notional > max_notional:
+        return False, "NOTIONAL_LIMIT_EXCEEDED"
+
+    # tamaño máximo por orden
+    max_order_size = float(getattr(client_risk, "max_order_size", float("inf")))
+    if qty > max_order_size:
+        return False, "ORDER_SIZE_LIMIT_EXCEEDED"
+
+    return True, None
+
+```
+-----8<----- END FILE: app/services/risk_service.py -----
+
+-----8<----- FILE: app/services/withdrawal_receipt.py (2254 bytes) -----
+```python
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+from io import BytesIO
+from datetime import datetime
+
+
+def generate_withdrawal_receipt_pdf(
+    *,
+    withdrawal_id: str,
+    user_name: str,
+    user_email: str,
+    amount: float,
+    currency: str,
+    bank_name: str | None,
+    clabe: str | None,
+    account_holder: str | None,
+    account_type: str | None,
+    phone: str | None,
+    status: str,
+    stripe_transfer_id: str | None,
+    created_at: datetime,
+    processed_at: datetime | None,
+    company_name: str = "Invertox",
+) -> bytes:
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=letter)
+    width, height = letter
+
+    y = height - 50
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(50, y, f"{company_name} — Comprobante de Retiro")
+    y -= 30
+
+    c.setFont("Helvetica", 10)
+    c.drawString(50, y, f"Withdrawal ID: {withdrawal_id}")
+    y -= 15
+    c.drawString(50, y, f"Status: {status}")
+    y -= 15
+    c.drawString(50, y, f"Created at: {created_at.isoformat()}")
+    y -= 15
+    if processed_at:
+        c.drawString(50, y, f"Processed at: {processed_at.isoformat()}")
+        y -= 15
+    if stripe_transfer_id:
+        c.drawString(50, y, f"Transfer reference: {stripe_transfer_id}")
+        y -= 20
+
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(50, y, "Beneficiario / Cliente")
+    y -= 18
+    c.setFont("Helvetica", 10)
+    c.drawString(50, y, f"Nombre: {user_name}")
+    y -= 14
+    c.drawString(50, y, f"Email: {user_email}")
+    y -= 14
+    if phone:
+        c.drawString(50, y, f"Tel: {phone}")
+        y -= 14
+
+    y -= 10
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(50, y, "Detalles del Retiro")
+    y -= 18
+    c.setFont("Helvetica", 10)
+    c.drawString(50, y, f"Monto: {amount:.2f} {currency}")
+    y -= 14
+    c.drawString(50, y, f"Banco: {bank_name or '-'}")
+    y -= 14
+    c.drawString(50, y, f"CLABE: {clabe or '-'}")
+    y -= 14
+    c.drawString(50, y, f"Titular: {account_holder or '-'}")
+    y -= 14
+    c.drawString(50, y, f"Tipo de cuenta: {account_type or '-'}")
+    y -= 25
+
+    c.setFont("Helvetica-Oblique", 9)
+    c.drawString(50, y, "Este comprobante es generado automáticamente.")
+    c.showPage()
+    c.save()
+
+    return buf.getvalue()
+
+```
+-----8<----- END FILE: app/services/withdrawal_receipt.py -----
+
+-----8<----- FILE: app/utils/enums.py (1122 bytes) -----
+```python
+from enum import Enum
+
+class Side(str, Enum):
+    BUY = "BUY"
+    SELL = "SELL"
+
+class OrderType(str, Enum):
+    MARKET = "MARKET"
+    LIMIT = "LIMIT"
+
+class TimeInForce(str, Enum):
+    GTC = "GTC"
+    DAY = "DAY"
+    IOC = "IOC"
+    FOK = "FOK"
+
+class OrderStatus(str, Enum):
+    NEW = "NEW"
+    PENDING_SEND = "PENDING_SEND"
+    SENT = "SENT"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    FILLED = "FILLED"
+    REJECTED = "REJECTED"
+    CANCELED = "CANCELED"
+
+class DepositStatus(str, Enum):
+    """Estados posibles para la intención de depósito."""
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELED = "canceled"
+
+class WithdrawalStatus(str, Enum):
+    """Estados del ciclo de vida de una solicitud de retiro."""
+    PENDING_REVIEW = "pending_review"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    CANCELED = "canceled"
+
+
+class KYCStatus(str, Enum):
+    """Estado del proceso KYC."""
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+
+```
+-----8<----- END FILE: app/utils/enums.py -----
+
+-----8<----- FILE: app/v1/api.py (1918 bytes) -----
+```python
+from fastapi import APIRouter, Depends, Header, Query
+from datetime import datetime, timezone
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func
+from ..db import get_session
+from ..models import Withdrawal, DepositIntent
+from .routers.deposits import router as deposits_router
+from .routers.stripe import router as stripe_router
+from .routers.withdrawals import router as withdrawals_router
+from .routers.kyc import router as kyc_router
+
+v1 = APIRouter(prefix="/v1")
+
+# --------- Helpers ---------
+
+def _resolve_client_id(clientId: str | None, x_client_id: str | None) -> str:
+    return clientId or x_client_id or "demo-client-1"
+
+
+# --------- Dashboard ---------
+
+@v1.get("/dashboard")
+async def dashboard(
+    clientId: str | None = Query(default=None),
+    x_client_id: str | None = Header(default=None, alias="X-Client-Id"),
+    db: AsyncSession = Depends(get_session),
+):
+    client_id = _resolve_client_id(clientId, x_client_id)
+    # Sum only completed deposit intents; use confirmed_amount if present else amount
+    dep_sum_expr = func.coalesce(
+        func.sum(func.coalesce(DepositIntent.confirmed_amount, DepositIntent.amount)),
+        0.0,
+    )
+    dep_sum = (
+        await db.execute(
+            select(dep_sum_expr).where(
+                DepositIntent.client_id == client_id,
+                DepositIntent.status == "completed",
+            )
+        )
+    ).scalar() or 0.0
+
+    wd_sum = (
+        await db.execute(
+            select(func.coalesce(func.sum(Withdrawal.amount), 0.0)).where(Withdrawal.client_id == client_id)
+        )
+    ).scalar() or 0.0
+
+    saldo = float(dep_sum) - float(wd_sum)
+    return {"saldo_retirable": saldo, "estrategias": []}
+
+
+
+
+# Include v1 routers for deposits, withdrawals, stripe, and kyc
+v1.include_router(deposits_router)
+v1.include_router(withdrawals_router)
+v1.include_router(stripe_router)
+v1.include_router(kyc_router)
+
+```
+-----8<----- END FILE: app/v1/api.py -----
+
+-----8<----- FILE: app/v1/repositories/deposits.py (1293 bytes) -----
+```python
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from ...models import DepositIntent
+
+class DepositIntentRepository:
+    def __init__(self, db: AsyncSession):
+        self.db = db
+
+    async def create(self, data: dict) -> DepositIntent:
+        obj = DepositIntent(**data)
+        self.db.add(obj)
+        await self.db.flush()
+        return obj
+
+    async def list_for_client(self, client_id: str, limit: int, offset: int) -> list[DepositIntent]:
+        stmt = (
+            select(DepositIntent)
+            .where(DepositIntent.client_id == client_id)
+            .order_by(DepositIntent.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        return list((await self.db.execute(stmt)).scalars().all())
+
+    async def get_by_id(self, deposit_id: str, client_id: str) -> DepositIntent | None:
+        stmt = select(DepositIntent).where(
+            DepositIntent.id == deposit_id,
+            DepositIntent.client_id == client_id,
+        )
+        return (await self.db.execute(stmt)).scalars().first()
+
+    async def get_by_id_no_owner(self, deposit_id: str) -> DepositIntent | None:
+        stmt = select(DepositIntent).where(DepositIntent.id == deposit_id)
+        return (await self.db.execute(stmt)).scalars().first()
+
+```
+-----8<----- END FILE: app/v1/repositories/deposits.py -----
+
+-----8<----- FILE: app/v1/repositories/kyc.py (1151 bytes) -----
+```python
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from ...models import KYCVerification, KYCWebhookEvent
+
+
+class KYCRepository:
+    def __init__(self, db: AsyncSession):
+        self.db = db
+
+    async def get_latest_for_client(self, client_id: str) -> KYCVerification | None:
+        stmt = (
+            select(KYCVerification)
+            .where(KYCVerification.client_id == client_id)
+            .order_by(KYCVerification.created_at.desc())
+        )
+        return (await self.db.execute(stmt)).scalars().first()
+
+    async def get_by_session_id(self, session_id: str) -> KYCVerification | None:
+        stmt = select(KYCVerification).where(KYCVerification.session_id == session_id)
+        return (await self.db.execute(stmt)).scalars().first()
+
+    async def create_verification(self, data: dict) -> KYCVerification:
+        obj = KYCVerification(**data)
+        self.db.add(obj)
+        await self.db.flush()
+        return obj
+
+    async def create_webhook_event(self, data: dict) -> KYCWebhookEvent:
+        obj = KYCWebhookEvent(**data)
+        self.db.add(obj)
+        await self.db.flush()
+        return obj
+
+```
+-----8<----- END FILE: app/v1/repositories/kyc.py -----
+
+-----8<----- FILE: app/v1/repositories/withdrawals.py (1127 bytes) -----
+```python
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from ...models import WithdrawalRequest
+
+class WithdrawalRequestRepository:
+    def __init__(self, db: AsyncSession):
+        self.db = db
+
+    async def create(self, data: dict) -> WithdrawalRequest:
+        obj = WithdrawalRequest(**data)
+        self.db.add(obj)
+        await self.db.flush()
+        return obj
+
+    async def list_for_client(self, client_id: str, limit: int, offset: int) -> list[WithdrawalRequest]:
+        stmt = (
+            select(WithdrawalRequest)
+            .where(WithdrawalRequest.client_id == client_id)
+            .order_by(WithdrawalRequest.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        return list((await self.db.execute(stmt)).scalars().all())
+
+    async def get_by_id(self, withdrawal_id: str, client_id: str) -> WithdrawalRequest | None:
+        stmt = select(WithdrawalRequest).where(
+            WithdrawalRequest.id == withdrawal_id,
+            WithdrawalRequest.client_id == client_id,
+        )
+        return (await self.db.execute(stmt)).scalars().first()
+
+```
+-----8<----- END FILE: app/v1/repositories/withdrawals.py -----
+
+-----8<----- FILE: app/v1/routers/deposits.py (3394 bytes) -----
+```python
+import os
+import logging
+from fastapi import APIRouter, Depends, HTTPException, Query, Header, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ...db import get_session
+from ...utils.enums import DepositStatus
+from ...models import DepositIntent
+from ..repositories.deposits import DepositIntentRepository
+from ..schemas.deposits import DepositIntentCreate, DepositIntentOut
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/deposits", tags=["Deposits"])
+
+def _resolve_client_id(clientId: str | None, x_client_id: str | None) -> str:
+    return clientId or x_client_id or "demo-client-1"
+
+def _is_sandbox() -> bool:
+    return os.getenv("DEBUG", "0") == "1" or os.getenv("TESTING", "0") == "1"
+
+@router.post("", response_model=DepositIntentOut, status_code=status.HTTP_201_CREATED)
+async def create_deposit_intent(
+    payload: DepositIntentCreate,
+    clientId: str | None = Query(default=None),
+    x_client_id: str | None = Header(default=None, alias="X-Client-Id"),
+    db: AsyncSession = Depends(get_session),
+):
+    client_id = _resolve_client_id(clientId, x_client_id)
+
+    logger.info(f"📥 [CREATE DEPOSIT] amount={payload.amount}, provider={payload.provider}, client_id={client_id}")
+
+    repo = DepositIntentRepository(db)
+    intent = await repo.create({
+        "client_id": client_id,
+        "amount": float(payload.amount),
+        "currency": payload.currency,
+        "payment_method": payload.payment_method,
+        "provider": payload.provider,
+        "status": DepositStatus.PENDING.value,
+        "metadata_": payload.metadata,
+    })
+
+    await db.commit()
+    await db.refresh(intent)
+
+    logger.info(f"💾 [CREATE DEPOSIT] Saved: deposit_id={intent.id}, amount={intent.amount}, provider={intent.provider}, payment_url={intent.payment_url}")
+
+    # Auto-complete ONLY if provider == mock_stripe and sandbox enabled
+    if payload.provider == "mock_stripe" and _is_sandbox():
+        intent.status = DepositStatus.COMPLETED.value
+        intent.confirmed_amount = intent.amount
+        await db.commit()
+        await db.refresh(intent)
+        logger.info(f"🤖 [AUTO-COMPLETE] Deposit {intent.id} completed in sandbox (client_id={client_id})")
+
+    return DepositIntentOut.from_orm_row(intent)
+
+@router.get("", response_model=list[DepositIntentOut])
+async def list_deposit_intents(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    clientId: str | None = Query(default=None),
+    x_client_id: str | None = Header(default=None, alias="X-Client-Id"),
+    db: AsyncSession = Depends(get_session),
+):
+    client_id = _resolve_client_id(clientId, x_client_id)
+    repo = DepositIntentRepository(db)
+    items = await repo.list_for_client(client_id, limit, offset)
+    return [DepositIntentOut.from_orm_row(i) for i in items]
+
+@router.get("/{deposit_id}", response_model=DepositIntentOut)
+async def get_deposit_intent(
+    deposit_id: str,
+    clientId: str | None = Query(default=None),
+    x_client_id: str | None = Header(default=None, alias="X-Client-Id"),
+    db: AsyncSession = Depends(get_session),
+):
+    client_id = _resolve_client_id(clientId, x_client_id)
+    repo = DepositIntentRepository(db)
+    intent = await repo.get_by_id(deposit_id, client_id)
+    if not intent:
+        raise HTTPException(status_code=404, detail="Depósito no encontrado")
+    return DepositIntentOut.from_orm_row(intent)
+
+```
+-----8<----- END FILE: app/v1/routers/deposits.py -----
+
+-----8<----- FILE: app/v1/routers/kyc.py (5388 bytes) -----
+```python
+import os
+import logging
+from datetime import datetime, timezone
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Query
+
+from sqlalchemy.ext.asyncio import AsyncSession
+from ...db import get_session
+from ...utils.enums import KYCStatus
+from ..schemas.kyc import KYCStartRequest, KYCSessionResponse, KYCStatusResponse
+from ..repositories.kyc import KYCRepository
+from ...services.kyc_providers.factory import get_kyc_provider
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/kyc", tags=["KYC"])  # parent /v1 is added by app/v1/api.py
+
+
+def _resolve_client_id(clientId: str | None, x_client_id: str | None) -> str:
+    return clientId or x_client_id or "demo-client-1"
+
+
+def _sandbox() -> bool:
+    return os.getenv("DEBUG", "0") == "1" or os.getenv("TESTING", "0") == "1"
+
+
+@router.post("/start", response_model=KYCSessionResponse)
+async def start_kyc(
+    payload: KYCStartRequest,
+    clientId: str | None = Query(default=None),
+    x_client_id: str | None = Header(default=None, alias="X-Client-Id"),
+    db: AsyncSession = Depends(get_session),
+):
+    client_id = _resolve_client_id(clientId, x_client_id)
+    provider_name = (payload.provider or "sumsub").lower()
+    provider = get_kyc_provider(provider_name)
+
+    # Idempotency: reuse last pending if exists
+    repo = KYCRepository(db)
+    existing = await repo.get_latest_for_client(client_id)
+    if existing and existing.status in (KYCStatus.PENDING.value,):
+        return KYCSessionResponse(provider=existing.provider, session_id=existing.session_id, redirect_url=None)
+
+    # Create applicant/session with provider
+    applicant = await provider.create_applicant(client_id=client_id, user_data={"client_id": client_id})
+    session_id = applicant.get("applicantId") or applicant.get("session_id")
+    if not session_id:
+        raise HTTPException(status_code=500, detail="KYC provider did not return applicantId")
+
+    access_token = None
+    sdk_url = None
+    redirect_url = None
+
+    try:
+        access_token = await provider.get_access_token(session_id)
+        sdk_url = "https://sdk.sumsub.com"
+        redirect_url = f"{os.getenv('FRONTEND_URL','http://localhost:5173')}/kyc?session_id={session_id}"
+    except Exception:
+        redirect_url = f"{os.getenv('FRONTEND_URL','http://localhost:5173')}/kyc?session_id={session_id}"
+
+    ver = await repo.create_verification({
+        "client_id": client_id,
+        "session_id": session_id,
+        "provider": provider_name,
+        "status": KYCStatus.PENDING.value,
+        "verification_level": os.getenv("SUMSUB_LEVEL_NAME"),
+        "provider_data": applicant,
+        "document_types": None,
+        "verified_at": None,
+    })
+    await db.commit()
+    await db.refresh(ver)
+
+    return KYCSessionResponse(
+        provider=provider_name,
+        session_id=session_id,
+        redirect_url=redirect_url,
+        access_token=access_token,
+        sdk_url=sdk_url,
+    )
+
+
+@router.get("/status", response_model=KYCStatusResponse)
+async def kyc_status(
+    clientId: str | None = Query(default=None),
+    x_client_id: str | None = Header(default=None, alias="X-Client-Id"),
+    db: AsyncSession = Depends(get_session),
+):
+    client_id = _resolve_client_id(clientId, x_client_id)
+    repo = KYCRepository(db)
+    ver = await repo.get_latest_for_client(client_id)
+    if not ver:
+        return KYCStatusResponse(status=KYCStatus.PENDING, updatedAt=None, updated_at=None, provider=None, session_id=None)
+
+    return KYCStatusResponse(
+        status=ver.status,
+        updatedAt=ver.updated_at,
+        updated_at=ver.updated_at,
+        provider=ver.provider,
+        session_id=ver.session_id,
+        verified_at=ver.verified_at,
+        reason=ver.reason,
+        verification_level=ver.verification_level,
+    )
+
+
+@router.post("/webhook")
+async def kyc_webhook(
+    request: Request,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    db: AsyncSession = Depends(get_session),
+):
+    payload = await request.json()
+    event_type = payload.get("type") or payload.get("eventType") or "unknown"
+
+    logger.info(f"[KYC WEBHOOK] type={event_type} idempotency={idempotency_key}")
+
+    provider_name = (payload.get("provider") or "sumsub").lower()
+    provider = get_kyc_provider(provider_name)
+
+    normalized = await provider.process_webhook(payload)
+    session_id = normalized.get("session_id")
+    if not session_id:
+        return {"status": "ignored", "reason": "missing_session_id"}
+
+    repo = KYCRepository(db)
+    ver = await repo.get_by_session_id(session_id)
+    if not ver:
+        return {"status": "error", "message": "KYC verification not found"}
+
+    ver.status = normalized.get("status") or KYCStatus.PENDING.value
+    ver.reason = normalized.get("reason")
+    ver.provider_data = normalized.get("provider_data") or payload
+    if normalized.get("verification_level"):
+        ver.verification_level = normalized["verification_level"]
+    if normalized.get("document_types"):
+        ver.document_types = normalized["document_types"]
+
+    if ver.status == KYCStatus.APPROVED.value:
+        ver.verified_at = datetime.now(timezone.utc)
+
+    await repo.create_webhook_event({
+        "kyc_verification_id": ver.id,
+        "event_type": event_type,
+        "raw_payload": payload,
+        "processed": True,
+    })
+
+    await db.commit()
+    return {"status": "success"}
+
+```
+-----8<----- END FILE: app/v1/routers/kyc.py -----
+
+-----8<----- FILE: app/v1/routers/stripe.py (6465 bytes) -----
+```python
+import os
+import stripe
+from fastapi import APIRouter, Depends, HTTPException, Request, Header
+from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ...db import get_session
+from ...utils.enums import DepositStatus
+from ...models import DepositIntent
+from ..repositories.deposits import DepositIntentRepository
+
+router = APIRouter(prefix="/stripe", tags=["Stripe Payments"])
+
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY", "")
+
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+
+
+def _is_sandbox() -> bool:
+    return os.getenv("DEBUG", "0") == "1" or os.getenv("TESTING", "0") == "1"
+
+
+class CreateCheckoutRequest(BaseModel):
+    deposit_id: str
+
+
+class CreateCheckoutResponse(BaseModel):
+    checkout_url: str
+    session_id: str
+
+
+@router.post("/create-checkout-session", response_model=CreateCheckoutResponse)
+async def create_checkout_session(
+    req: CreateCheckoutRequest,
+    client_id_header: str | None = Header(default=None, alias="X-Client-Id"),
+    db: AsyncSession = Depends(get_session),
+):
+    client_id = client_id_header or "demo-client-1"
+    repo = DepositIntentRepository(db)
+
+    deposit = await repo.get_by_id(req.deposit_id, client_id)
+    if not deposit:
+        raise HTTPException(status_code=404, detail="Deposit not found")
+
+    if deposit.status != DepositStatus.PENDING.value:
+        raise HTTPException(status_code=400, detail=f"Deposit is already {deposit.status}")
+
+    if deposit.amount <= 0:
+        raise HTTPException(status_code=400, detail=f"Invalid deposit amount: {deposit.amount}")
+
+    try:
+        unit_amount = int(float(deposit.amount) * 100)
+
+        session = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            line_items=[{
+                "price_data": {
+                    "currency": (deposit.currency or "USD").lower(),
+                    "product_data": {
+                        "name": "Depósito a cuenta de trading",
+                        "description": f"Depósito de {deposit.amount} {deposit.currency}",
+                    },
+                    "unit_amount": unit_amount,
+                },
+                "quantity": 1,
+            }],
+            mode="payment",
+            metadata={
+                "deposit_id": str(deposit.id),
+                "client_id": str(client_id),
+            },
+            success_url=f"{FRONTEND_URL}/deposit/success?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{FRONTEND_URL}/deposit/cancel",
+        )
+
+        deposit.provider = "stripe"
+        deposit.provider_reference = session.id
+        deposit.payment_url = session.url
+        deposit.status = DepositStatus.PROCESSING.value
+        await db.commit()
+        await db.refresh(deposit)
+
+        return CreateCheckoutResponse(checkout_url=session.url, session_id=session.id)
+
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=400, detail=f"Stripe error: {str(e)}")
+
+
+@router.post("/simulate-payment-success/{deposit_id}")
+async def simulate_payment_success(
+    deposit_id: str,
+    client_id_header: str | None = Header(default=None, alias="X-Client-Id"),
+    db: AsyncSession = Depends(get_session),
+):
+    if not _is_sandbox():
+        raise HTTPException(status_code=403, detail="Este endpoint solo está disponible en modo desarrollo")
+
+    client_id = client_id_header or "demo-client-1"
+    repo = DepositIntentRepository(db)
+
+    deposit = await repo.get_by_id(deposit_id, client_id)
+    if not deposit:
+        raise HTTPException(status_code=404, detail="Depósito no encontrado")
+
+    if deposit.status == DepositStatus.COMPLETED.value:
+        return {"status": "already_completed", "deposit_id": deposit.id}
+
+    deposit.status = DepositStatus.COMPLETED.value
+    deposit.confirmed_amount = float(deposit.amount)
+    await db.commit()
+    await db.refresh(deposit)
+
+    return {
+        "status": "success",
+        "deposit_id": deposit.id,
+        "amount": deposit.amount,
+        "confirmed_amount": deposit.confirmed_amount,
+        "currency": deposit.currency,
+    }
+
+
+@router.post("/webhook")
+async def stripe_webhook(
+    request: Request,
+    stripe_signature: str = Header(None, alias="Stripe-Signature"),
+    db: AsyncSession = Depends(get_session),
+):
+    payload = await request.body()
+
+    try:
+        event = stripe.Webhook.construct_event(payload, stripe_signature, WEBHOOK_SECRET)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    repo = DepositIntentRepository(db)
+
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        deposit_id = session.get("metadata", {}).get("deposit_id")
+        if not deposit_id:
+            return {"status": "ignored", "reason": "missing_deposit_id"}
+
+        deposit = await repo.get_by_id_no_owner(deposit_id)
+        if not deposit:
+            return {"status": "error", "message": "Deposit not found"}
+
+        deposit.status = DepositStatus.COMPLETED.value
+        amount_total = session.get("amount_total")
+        if amount_total is not None:
+            deposit.confirmed_amount = float(amount_total) / 100.0
+        await db.commit()
+        return {"status": "success"}
+
+    if event["type"] == "checkout.session.expired":
+        session = event["data"]["object"]
+        deposit_id = session.get("metadata", {}).get("deposit_id")
+        if deposit_id:
+            deposit = await repo.get_by_id_no_owner(deposit_id)
+            if deposit:
+                deposit.status = DepositStatus.CANCELED.value
+                await db.commit()
+        return {"status": "success"}
+
+    if event["type"] == "payment_intent.payment_failed":
+        # Not enough info by default; ignoring.
+        return {"status": "ignored"}
+
+    return {"status": "ignored"}
+
+
+@router.get("/session/{session_id}")
+async def get_stripe_session(session_id: str):
+    try:
+        s = stripe.checkout.Session.retrieve(session_id)
+        return {
+            "session_id": s.id,
+            "payment_status": s.payment_status,
+            "amount_total": s.amount_total,
+            "currency": s.currency,
+        }
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=400, detail=f"Stripe error: {str(e)}")
+
+```
+-----8<----- END FILE: app/v1/routers/stripe.py -----
+
+-----8<----- FILE: app/v1/routers/withdrawals.py (6392 bytes) -----
+```python
+import os
+import logging
+from fastapi import APIRouter, Depends, HTTPException, Query, Header, status
+from fastapi.responses import Response
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ...db import get_session
+from ...utils.enums import WithdrawalStatus
+from ..repositories.withdrawals import WithdrawalRequestRepository
+from ..schemas.withdrawals import WithdrawalRequestCreate, WithdrawalRequestOut
+from ...services.withdrawal_receipt import generate_withdrawal_receipt_pdf
+
+logger = logging.getLogger(__name__)
+
+# Using prefix "/withdrawals" because v1 router already has prefix "/v1"
+router = APIRouter(prefix="/withdrawals", tags=["Withdrawals"])
+
+
+def _resolve_client_id(clientId: str | None, x_client_id: str | None) -> str:
+    return clientId or x_client_id or "demo-client-1"
+
+
+def _auto_approve_enabled() -> bool:
+    return os.getenv("AUTO_APPROVE_WITHDRAWALS", "0") == "1"
+
+
+@router.post("", response_model=WithdrawalRequestOut, status_code=status.HTTP_201_CREATED)
+async def create_withdrawal_request(
+    payload: WithdrawalRequestCreate,
+    clientId: str | None = Query(default=None),
+    x_client_id: str | None = Header(default=None, alias="X-Client-Id"),
+    db: AsyncSession = Depends(get_session),
+):
+    client_id = _resolve_client_id(clientId, x_client_id)
+
+    repo = WithdrawalRequestRepository(db)
+    req = await repo.create({
+        "client_id": client_id,
+        "investment_id": payload.investment_id,
+        "amount": float(payload.amount),
+        "currency": payload.currency,
+
+        "bank_code": payload.bank_code,
+        "bank_name": payload.bank_name,
+        "account_type": payload.account_type,
+        "clabe": payload.clabe,
+        "account_holder": payload.account_holder,
+
+        "email": payload.email,
+        "phone": payload.phone,
+        "concept": payload.concept,
+
+        "status": WithdrawalStatus.PENDING_REVIEW.value,
+        "preview_snapshot": payload.preview_snapshot,
+        "metadata_": payload.metadata,
+    })
+    await db.commit()
+    await db.refresh(req)
+
+    # Auto-approve and complete in sandbox/demo
+    if _auto_approve_enabled():
+        req.status = WithdrawalStatus.COMPLETED.value
+
+        if req.metadata_ is None:
+            req.metadata_ = {}
+        req.metadata_["stripe_transfer_id"] = f"tr_mock_{req.id}"
+        req.metadata_["auto_approved"] = True
+
+        await db.commit()
+        await db.refresh(req)
+        logger.info(
+            f"🤖 [AUTO-APPROVE] Withdrawal {req.id} auto-completed (amount={req.amount} {req.currency})"
+        )
+
+    return WithdrawalRequestOut.from_orm_row(req)
+
+
+@router.get("", response_model=list[WithdrawalRequestOut])
+async def list_withdrawal_requests(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    clientId: str | None = Query(default=None),
+    x_client_id: str | None = Header(default=None, alias="X-Client-Id"),
+    db: AsyncSession = Depends(get_session),
+):
+    client_id = _resolve_client_id(clientId, x_client_id)
+    repo = WithdrawalRequestRepository(db)
+    items = await repo.list_for_client(client_id, limit, offset)
+    return [WithdrawalRequestOut.from_orm_row(i) for i in items]
+
+
+@router.get("/{request_id}", response_model=WithdrawalRequestOut)
+async def get_withdrawal_request(
+    request_id: str,
+    clientId: str | None = Query(default=None),
+    x_client_id: str | None = Header(default=None, alias="X-Client-Id"),
+    db: AsyncSession = Depends(get_session),
+):
+    client_id = _resolve_client_id(clientId, x_client_id)
+    repo = WithdrawalRequestRepository(db)
+    req = await repo.get_by_id(request_id, client_id)
+    if not req:
+        raise HTTPException(status_code=404, detail="Solicitud no encontrada")
+    return WithdrawalRequestOut.from_orm_row(req)
+
+
+@router.get("/{request_id}/receipt", response_class=Response)
+async def download_withdrawal_receipt(
+    request_id: str,
+    clientId: str | None = Query(default=None),
+    x_client_id: str | None = Header(default=None, alias="X-Client-Id"),
+    db: AsyncSession = Depends(get_session),
+):
+    client_id = _resolve_client_id(clientId, x_client_id)
+    repo = WithdrawalRequestRepository(db)
+    withdrawal = await repo.get_by_id(request_id, client_id)
+    if not withdrawal:
+        logger.warning(
+            f"Unauthorized/NotFound receipt download client_id={client_id} withdrawal_id={request_id}"
+        )
+        raise HTTPException(status_code=404, detail="Retiro no encontrado")
+
+    stripe_transfer_id = None
+    processed_at = None
+    if withdrawal.metadata_:
+        stripe_transfer_id = withdrawal.metadata_.get("stripe_transfer_id")
+        if withdrawal.status in [WithdrawalStatus.COMPLETED.value, WithdrawalStatus.PROCESSING.value]:
+            if withdrawal.status == WithdrawalStatus.COMPLETED.value:
+                processed_at = withdrawal.updated_at
+
+    user_display_name = withdrawal.account_holder or "Usuario"
+
+    try:
+        pdf_bytes = generate_withdrawal_receipt_pdf(
+            withdrawal_id=withdrawal.id,
+            user_name=user_display_name,
+            user_email=withdrawal.email or "-",
+            amount=withdrawal.amount,
+            currency=withdrawal.currency,
+            bank_name=withdrawal.bank_name,
+            clabe=withdrawal.clabe,
+            account_holder=withdrawal.account_holder,
+            account_type=withdrawal.account_type,
+            phone=withdrawal.phone,
+            status=withdrawal.status,
+            stripe_transfer_id=stripe_transfer_id,
+            created_at=withdrawal.created_at,
+            processed_at=processed_at,
+            company_name=os.getenv("COMPANY_NAME", "Invertox"),
+        )
+    except Exception as e:
+        logger.error(
+            f"Error generating withdrawal PDF client_id={client_id} withdrawal_id={withdrawal.id} err={e}",
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="No se pudo generar el comprobante")
+
+    filename = f"comprobante_retiro_{withdrawal.id}.pdf"
+    logger.info(
+        f"Receipt downloaded client_id={client_id} withdrawal_id={withdrawal.id} amount={withdrawal.amount} status={withdrawal.status}"
+    )
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(pdf_bytes)),
+        },
+    )
+
+```
+-----8<----- END FILE: app/v1/routers/withdrawals.py -----
+
+-----8<----- FILE: app/v1/schemas/deposits.py (1334 bytes) -----
+```python
+from pydantic import BaseModel, Field
+from typing import Optional, Dict, Any
+from datetime import datetime
+from ...utils.enums import DepositStatus
+
+class DepositIntentCreate(BaseModel):
+    amount: float = Field(gt=0)
+    currency: str = "USD"
+    payment_method: str = "card"
+    provider: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+class DepositIntentOut(BaseModel):
+    id: str
+    amount: float
+    currency: str
+    payment_method: str
+    provider: Optional[str] = None
+    provider_reference: Optional[str] = None
+    payment_url: Optional[str] = None
+    status: DepositStatus
+    metadata: Optional[Dict[str, Any]] = None
+    confirmed_amount: Optional[float] = None
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def from_orm_row(cls, row):
+        return cls(
+            id=row.id,
+            amount=row.amount,
+            currency=row.currency,
+            payment_method=row.payment_method,
+            provider=row.provider,
+            provider_reference=row.provider_reference,
+            payment_url=row.payment_url,
+            status=row.status,
+            metadata=row.metadata_ if hasattr(row, "metadata_") else None,
+            confirmed_amount=row.confirmed_amount,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+        )
+
+```
+-----8<----- END FILE: app/v1/schemas/deposits.py -----
+
+-----8<----- FILE: app/v1/schemas/kyc.py (797 bytes) -----
+```python
+from pydantic import BaseModel
+from typing import Optional
+from datetime import datetime
+from ...utils.enums import KYCStatus
+
+
+class KYCStartRequest(BaseModel):
+    provider: Optional[str] = "sumsub"
+
+
+class KYCSessionResponse(BaseModel):
+    provider: str
+    session_id: str
+    redirect_url: Optional[str] = None
+
+    # opcional (si luego quieres SDK token)
+    access_token: Optional[str] = None
+    sdk_url: Optional[str] = None
+
+
+class KYCStatusResponse(BaseModel):
+    status: KYCStatus
+    updatedAt: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    # extras tipo el doc
+    provider: Optional[str] = None
+    session_id: Optional[str] = None
+    verified_at: Optional[datetime] = None
+    reason: Optional[str] = None
+    verification_level: Optional[str] = None
+
+```
+-----8<----- END FILE: app/v1/schemas/kyc.py -----
+
+-----8<----- FILE: app/v1/schemas/withdrawals.py (2300 bytes) -----
+```python
+from pydantic import BaseModel, Field
+from typing import Optional, Dict, Any
+from datetime import datetime
+from ...utils.enums import WithdrawalStatus
+
+class WithdrawalRequestCreate(BaseModel):
+    amount: float = Field(gt=0)
+    currency: str = "USD"
+
+    bank_code: Optional[str] = None
+    bank_name: Optional[str] = None
+    account_type: Optional[str] = None
+    clabe: Optional[str] = None
+    account_holder: Optional[str] = None
+
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    concept: Optional[str] = None
+
+    investment_id: Optional[str] = None
+
+    preview_snapshot: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+class WithdrawalRequestOut(BaseModel):
+    id: str
+    amount: float
+    currency: str
+
+    bank_code: Optional[str] = None
+    bank_name: Optional[str] = None
+    account_type: Optional[str] = None
+    clabe: Optional[str] = None
+    account_holder: Optional[str] = None
+
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    concept: Optional[str] = None
+
+    status: WithdrawalStatus
+
+    preview_snapshot: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+    reviewed_by: Optional[str] = None
+    reviewed_at: Optional[datetime] = None
+
+    created_at: datetime
+    updated_at: datetime
+
+    # For UI compatibility (optional): derived reference
+    reference: Optional[str] = None
+
+    @classmethod
+    def from_orm_row(cls, row):
+        ref = None
+        if getattr(row, "metadata_", None):
+            ref = row.metadata_.get("stripe_transfer_id")
+        return cls(
+            id=row.id,
+            amount=float(row.amount),
+            currency=row.currency,
+
+            bank_code=row.bank_code,
+            bank_name=row.bank_name,
+            account_type=row.account_type,
+            clabe=row.clabe,
+            account_holder=row.account_holder,
+
+            email=row.email,
+            phone=row.phone,
+            concept=row.concept,
+
+            status=row.status,
+
+            preview_snapshot=row.preview_snapshot,
+            metadata=row.metadata_,
+
+            reviewed_by=row.reviewed_by,
+            reviewed_at=row.reviewed_at,
+
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+            reference=ref,
+        )
+
+```
+-----8<----- END FILE: app/v1/schemas/withdrawals.py -----
+
+-----8<----- FILE: app/ws.py (967 bytes) -----
+```python
+import asyncio
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from .services.event_bus import event_bus
+
+# Fase 2.2 — WebSockets de órdenes por cliente
+
+ws_router = APIRouter()
+
+
+@ws_router.websocket("/ws/orders/{client_id}")
+async def ws_orders(websocket: WebSocket, client_id: str):
+    await websocket.accept()
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def on_event(evt):
+        # Recibir desde hilos externos de FIX, pasar al loop de asyncio
+        loop.call_soon_threadsafe(queue.put_nowait, evt)
+
+    # Suscribir al tópico del cliente y guardar unsubscribe
+    topic = f"orders.{client_id}"
+    unsubscribe = event_bus.subscribe(topic, on_event)
+
+    try:
+        while True:
+            evt = await queue.get()
+            await websocket.send_json(evt)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        try:
+            unsubscribe()
+        except Exception:
+            pass
+
+```
+-----8<----- END FILE: app/ws.py -----
+
+-----8<----- FILE: flatten.sh (3251 bytes) -----
+```bash
+#!/usr/bin/env bash
+# Flatten this repository into a single monolithic text file for LLM analysis.
+# Usage:
+#   ./flatten.sh [OUTPUT_FILE]
+# Default OUTPUT_FILE is project_monolith.txt in repo root.
+# Notes:
+# - Only text files are included (based on `file --mime`), binaries are skipped.
+# - Common junk/virtual/cache directories are excluded.
+# - Each file is wrapped with a clear delimiter that includes its relative path.
+
+set -euo pipefail
+
+# Determine repo root (directory of this script)
+REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$REPO_ROOT"
+
+OUTPUT_FILE="${1:-project_monolith.txt}"
+
+# Stat helper supporting macOS and Linux
+file_size() {
+  local f="$1"
+  if command -v gstat >/dev/null 2>&1; then
+    gstat -c %s "$f"
+  elif stat -f %z "$f" >/dev/null 2>&1; then
+    stat -f %z "$f"  # macOS
+  else
+    stat -c %s "$f"  # Linux
+  fi
+}
+
+# Decide if a file is text (skip binaries)
+is_text_file() {
+  local f="$1"
+  local mt
+  mt=$(file -b --mime-type "$f" 2>/dev/null || echo "application/octet-stream")
+  [[ "$mt" == text/* || "$mt" == application/json || "$mt" == application/xml || "$mt" == application/x-sh ]] \
+    && return 0 || return 1
+}
+
+# Exclude patterns
+should_exclude() {
+  local f="$1"
+  case "$f" in
+    ./$(basename "$OUTPUT_FILE") ) return 0;;
+    ./.git/*|.git) return 0;;
+    ./.svn/*|.svn) return 0;;
+    ./.hg/*|.hg) return 0;;
+    ./.idea/*|.idea) return 0;;
+    ./.vscode/*|.vscode) return 0;;
+    ./node_modules/*|node_modules) return 0;;
+    ./.venv/*|.venv) return 0;;
+    ./venv/*|venv) return 0;;
+    ./*__pycache__/*|*__pycache__*) return 0;;
+    ./.pytest_cache/*|.pytest_cache) return 0;;
+    ./.mypy_cache/*|.mypy_cache) return 0;;
+    ./.coverage|.coverage) return 0;;
+    ./*.pyc|*.pyc) return 0;;
+    ./dist/*|dist) return 0;;
+    ./build/*|build) return 0;;
+    ./*.db|*.db) return 0;;
+    ./*.sqlite|*.sqlite) return 0;;
+    ./*.sqlite3|*.sqlite3) return 0;;
+    ./.DS_Store|.DS_Store) return 0;;
+    *) return 1;;
+  esac
+}
+
+# Initialize output
+: > "$OUTPUT_FILE"
+
+# Header
+{
+  echo "# Monolithic project bundle"
+  echo "# Generated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  echo "# Repo root: $REPO_ROOT"
+  echo
+} >> "$OUTPUT_FILE"
+
+# Collect and sort files
+
+append_file() {
+  local f="$1"
+  local rel="${f#./}"
+  local size
+  size=$(file_size "$f" 2>/dev/null || echo 0)
+
+  # Delimiter header
+  {
+    echo "-----8<----- FILE: $rel ($size bytes) -----"
+    # Provide an indicative code fence for some common types
+    case "$rel" in
+      *.py) echo '```python';;
+      *.yaml|*.yml) echo '```yaml';;
+      *.json) echo '```json';;
+      *.sh) echo '```bash';;
+      *.md) echo '```markdown';;
+      *) echo '```';;
+    esac
+    cat "$f"
+    echo
+    echo '```'
+    echo "-----8<----- END FILE: $rel -----"
+    echo
+  } >> "$OUTPUT_FILE"
+}
+
+# Iterate sorted file list in a portable way (no mapfile)
+find . -type f \
+  ! -name ".git" -a ! -path "*/.git/*" \
+  -print | LC_ALL=C sort | while IFS= read -r f; do
+  # Skip the output file itself and excluded paths
+  if should_exclude "$f"; then
+    continue
+  fi
+  # Include only text-like files
+  if is_text_file "$f"; then
+    append_file "$f"
+  fi
+done
+
+# Summary footer
+{
+  echo "# End of bundle"
+} >> "$OUTPUT_FILE"
+
+echo "Created monolith: $OUTPUT_FILE"
+
+```
+-----8<----- END FILE: flatten.sh -----
+
+-----8<----- FILE: requirements.txt (146 bytes) -----
+```
+fastapi==0.115.2
+uvicorn==0.30.6
+SQLAlchemy==2.0.36
+pydantic==2.9.2
+pydantic-settings==2.6.1
+python-dotenv==1.0.1
+stripe>=10.0.0
+reportlab>=4.0.0
+
+```
+-----8<----- END FILE: requirements.txt -----
+
+-----8<----- FILE: run_server.sh (409 bytes) -----
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")"
+
+# Load local environment variables if .env exists
+if [ -f ".env" ]; then
+  set -a
+  source ".env"
+  set +a
+fi
+
+VENV="${VENV:-.venv}"
+PYTHON="${PYTHON:-python3}"
+
+if [ ! -d "$VENV" ]; then
+  "$PYTHON" -m venv "$VENV"
+fi
+
+source "$VENV/bin/activate"
+
+exec uvicorn app.main:app --reload --host "${HOST:-0.0.0.0}" --port "${PORT:-8000}"
+
+```
+-----8<----- END FILE: run_server.sh -----
+
+-----8<----- FILE: scripts/export_openapi.py (1618 bytes) -----
+```python
+#!/usr/bin/env python3
+"""
+Export the OpenAPI spec generated by the running FastAPI app (source of truth).
+
+Usage:
+  python scripts/export_openapi.py
+
+Outputs:
+  - openapi.generated.json (always)
+  - openapi.generated.yaml (optional, if PyYAML is available)
+
+This script imports app.main:app to ensure the exported spec matches exactly what the
+server would serve at /openapi.json.
+"""
+import json
+import os
+import sys
+
+# Try to optionally support YAML export if PyYAML is available
+try:
+    import yaml  # type: ignore
+except Exception:  # pragma: no cover
+    yaml = None
+
+
+def main():
+    # Import the FastAPI app from the project
+    try:
+        from app.main import app  # noqa: F401
+    except Exception as e:
+        print(f"Failed to import app.main:app: {e}")
+        sys.exit(1)
+
+    # Build OpenAPI dict via FastAPI
+    openapi = app.openapi()
+
+    repo_root = os.path.dirname(os.path.dirname(__file__))
+    json_path = os.path.join(repo_root, "openapi.generated.json")
+    yaml_path = os.path.join(repo_root, "openapi.generated.yaml")
+
+    # Write JSON (pretty)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(openapi, f, indent=2, ensure_ascii=False)
+    print(f"Wrote {json_path}")
+
+    # Optionally write YAML
+    if yaml is not None:
+        with open(yaml_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(openapi, f, sort_keys=False, allow_unicode=True)
+        print(f"Wrote {yaml_path}")
+    else:
+        print("PyYAML not installed; skipping openapi.generated.yaml.\n"
+              "Install with: pip install pyyaml")
+
+
+if __name__ == "__main__":
+    main()
+
+```
+-----8<----- END FILE: scripts/export_openapi.py -----
+
+-----8<----- FILE: smoke_tests.py (2963 bytes) -----
+```python
+#!/usr/bin/env python3
+import time
+import uuid
+import requests
+
+BASE = "http://localhost:8000"
+
+# ----------------------
+# Helper functions
+# ----------------------
+
+def check_health():
+    print(">> Checking /health ...")
+    r = requests.get(f"{BASE}/health")
+    assert r.status_code == 200
+    assert r.json().get("status") == "OK"
+    print("   PASSED")
+
+
+def create_order():
+    print(">> Creating order /orders ...")
+    payload = {
+        "clientId": "SMOKE",
+        "symbol": "XAUUSD",
+        "side": "BUY",
+        "type": "LIMIT",
+        "qty": 1,
+        "price": 2000.0,
+        "timeInForce": "GTC",
+    }
+    r = requests.post(f"{BASE}/orders", json=payload)
+    assert r.status_code == 201, f"Expected 201, got {r.status_code}"
+    order = r.json()
+    print("   Order created:", order["id"])
+    return order["id"]
+
+
+def get_order(order_id):
+    r = requests.get(f"{BASE}/orders/{order_id}")
+    assert r.status_code == 200, "Expected 200 for GET order"
+    return r.json()
+
+
+def wait_for_order_state_change(order_id, max_wait=3.0, interval=0.2):
+    print(">> Waiting for order state to change from NEW ...")
+
+    elapsed = 0
+    while elapsed < max_wait:
+        order = get_order(order_id)
+        if order["status"] != "NEW":
+            print(f"   Status changed to: {order['status']}")
+            return order
+        time.sleep(interval)
+        elapsed += interval
+
+    raise AssertionError("Order stayed in NEW state too long — FIX mock may not be running")
+
+
+def list_orders():
+    print(">> Listing /orders?clientId=SMOKE ...")
+    r = requests.get(f"{BASE}/orders", params={"clientId": "SMOKE"})
+    assert r.status_code == 200
+    data = r.json()
+    print(f"   Found {len(data)} orders")
+    return data
+
+
+def cancel_fake_order():
+    print(">> Cancelling non-existing order (expect 404) ...")
+    fake_id = str(uuid.uuid4())
+    r = requests.post(f"{BASE}/orders/{fake_id}/cancel")
+    assert r.status_code == 404, f"Expected 404, got {r.status_code}"
+    print("   PASSED (404 received)")
+
+
+def get_positions():
+    print(">> GET /positions?clientId=SMOKE ...")
+    r = requests.get(f"{BASE}/positions", params={"clientId": "SMOKE"})
+    assert r.status_code == 200
+    positions = r.json()
+    print("   Positions:", positions)
+    return positions
+
+
+# ----------------------
+# Smoke Test Runner
+# ----------------------
+
+def run():
+    print("\n=== SMOKE TESTS START ===\n")
+
+    check_health()
+
+    order_id = create_order()
+
+    # Wait for FIX mock to process fills
+    order = wait_for_order_state_change(order_id)
+
+    # Final state must be one of:
+    valid_states = (
+        "PENDING_SEND",
+        "SENT",
+        "PARTIALLY_FILLED",
+        "FILLED",
+        "REJECTED",
+    )
+    assert order["status"] in valid_states, f"Unexpected status: {order['status']}"
+
+    list_orders()
+    cancel_fake_order()
+    get_positions()
+
+    print("\n=== ALL SMOKE TESTS PASSED ===\n")
+
+
+if __name__ == "__main__":
+    run()
+
+```
+-----8<----- END FILE: smoke_tests.py -----
+
+# End of bundle
