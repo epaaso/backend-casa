@@ -31,6 +31,7 @@ class Order(BaseModel):
     type: OrderType
     qty: float
     price: Optional[float] = None
+    timeInForce: TimeInForce
     status: OrderStatus
     cumQty: float
     filledQty: float

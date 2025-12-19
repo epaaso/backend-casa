@@ -3,6 +3,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Query, Header, status
 from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
 
 from ...db import get_session
 from ...utils.enums import WithdrawalStatus
@@ -131,7 +132,9 @@ async def download_withdrawal_receipt(
     user_display_name = withdrawal.account_holder or "Usuario"
 
     try:
-        pdf_bytes = generate_withdrawal_receipt_pdf(
+        # Issue #3: Wrap blocking PDF generation in threadpool
+        pdf_bytes = await run_in_threadpool(
+            generate_withdrawal_receipt_pdf,
             withdrawal_id=withdrawal.id,
             user_name=user_display_name,
             user_email=withdrawal.email or "-",

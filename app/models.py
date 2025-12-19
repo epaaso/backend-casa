@@ -25,6 +25,12 @@ class Order(Base):
     avg_px: Mapped[float | None] = mapped_column(Float, nullable=True)
     reject_reason: Mapped[str | None] = mapped_column(String, nullable=True)
 
+    # Issue #8: Venue ID fields for future Centroid/FIX integration
+    cl_ord_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)  # ClOrdID (our ID in FIX)
+    orig_cl_ord_id: Mapped[str | None] = mapped_column(String, nullable=True)  # OrigClOrdID (for cancel/replace)
+    venue_order_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)  # OrderID from venue
+    last_exec_id: Mapped[str | None] = mapped_column(String, nullable=True)  # ExecID (for dedupe)
+
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
