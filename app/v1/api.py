@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from ..db import get_session
-from ..models import WithdrawalRequest, DepositIntent
+from ..models import WithdrawalRequestRequest, DepositIntent
 from ..utils.enums import WithdrawalStatus
 from .routers.deposits import router as deposits_router
 from .routers.stripe import router as stripe_router
@@ -41,18 +41,11 @@ async def dashboard(
         )
     ).scalar() or 0.0
 
+    # Solo contar retiros completados, no los pendientes o rechazados
     # Issue #2: Use WithdrawalRequest (not Withdrawal) and filter by "money leaving" statuses
     wd_sum = (
         await db.execute(
-            select(func.coalesce(func.sum(WithdrawalRequest.amount), 0.0)).where(
-                WithdrawalRequest.client_id == client_id,
-                WithdrawalRequest.status.in_([
-                    WithdrawalStatus.PENDING_REVIEW.value,
-                    WithdrawalStatus.APPROVED.value,
-                    WithdrawalStatus.PROCESSING.value,
-                    WithdrawalStatus.COMPLETED.value,
-                ])
-            )
+            select(func.coalesce(func.sum(Withdrawal.amount), 0.0)).where(Withdrawal.client_id == client_id)
         )
     ).scalar() or 0.0
 
