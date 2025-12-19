@@ -2,7 +2,6 @@
 from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Header
-from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from .db import get_session
 from .models import Order as OrderModel
@@ -16,11 +15,18 @@ from .services.metrics import record, snapshot
 from .services.reconciliation_service import reconcile_internal
 from .utils.enums import OrderStatus, Side, OrderType, TimeInForce
 from .services.fix_gateway import fix_gateway
-from .services.event_bus import event_bus
 
 router = APIRouter()
 
 get_db = get_session
+
+
+# Issue #1: Helper function to enforce order ownership
+async def _require_order_owner(order: OrderModel, x_client_id: str | None):
+    if not x_client_id:
+        raise HTTPException(status_code=400, detail="X-Client-Id header is required")
+    if order.client_id != x_client_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
 
 @router.get("/health")
@@ -100,7 +106,15 @@ async def create_order(payload: OrderCreateRequest, db: AsyncSession = Depends(g
 
     await db.commit()     # <<< CRITICAL FIX: allow worker thread to see the order
 
-    await fix_gateway.enqueue_send(order.id)
+    # Issue: Catch RuntimeError from full queue and gracefully reject with GATEWAY_BUSY
+    try:
+        await fix_gateway.enqueue_send(order.id)
+    except RuntimeError:
+        order.status = OrderStatus.REJECTED.value
+        order.reject_reason = "GATEWAY_BUSY"
+        db.add(order)
+        await db.commit()
+        return to_schema(order)
 
     return to_schema(order)
 
@@ -123,38 +137,58 @@ async def list_orders(
 
 
 @router.get("/orders/{orderId}", response_model=OrderSchema)
-async def get_order(orderId: str, db: AsyncSession = Depends(get_db)):
+async def get_order(orderId: str, db: AsyncSession = Depends(get_db),
+                    x_client_id: str | None = Header(default=None, alias="X-Client-Id")):
     repo = OrderRepository(db)
     order = await repo.get(orderId)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
+    await _require_order_owner(order, x_client_id)
     return to_schema(order)
 
 
 @router.post("/orders/{orderId}/cancel", response_model=OrderSchema)
-async def cancel_order(orderId: str, db: AsyncSession = Depends(get_db)):
-    """Commit DB before enqueueing FIX cancel event."""
+async def cancel_order(orderId: str, db: AsyncSession = Depends(get_db),
+                       x_client_id: str | None = Header(default=None, alias="X-Client-Id")):
+    """Issue #1: Enforce ownership. Issue #4: Set CANCEL_REQUESTED immediately."""
     repo = OrderRepository(db)
 
     order = await repo.get(orderId)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    await db.commit()     # <<< CRITICAL FIX: persist order state before FIX cancel
+    await _require_order_owner(order, x_client_id)
 
+    # If already in terminal state, return as-is
+    if order.status in (OrderStatus.FILLED.value, OrderStatus.CANCELED.value, OrderStatus.REJECTED.value):
+        return to_schema(order)
+
+    # Set CANCEL_REQUESTED immediately so _process_send can detect it
+    order.status = OrderStatus.CANCEL_REQUESTED.value
+    db.add(order)
+    await db.commit()
+
+    # Publish update for immediate UX feedback
+    fix_gateway._publish_update(order)
+    
+    # Enqueue cancel event for processing
     await fix_gateway.enqueue_cancel(order.id)
 
     return to_schema(order)
 
 
 @router.patch("/orders/{orderId}", response_model=OrderSchema)
-async def amend_order(orderId: str, payload: OrderAmendRequest, db: AsyncSession = Depends(get_db)):
+async def amend_order(orderId: str, payload: OrderAmendRequest, db: AsyncSession = Depends(get_db),
+                      x_client_id: str | None = Header(default=None, alias="X-Client-Id")):
     repo = OrderRepository(db)
     order = await repo.get(orderId)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    editable = {OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED}
+    await _require_order_owner(order, x_client_id)
+
+    # Issue #1: order.status is a string in DB, compare with .value
+    editable = {OrderStatus.NEW.value, OrderStatus.PARTIALLY_FILLED.value}
     if order.status not in editable:
         raise HTTPException(status_code=400, detail=f"Order not editable in current status ({order.status}). Editable statuses: NEW, PARTIALLY_FILLED. Amend is not allowed in PENDING_SEND or SENT.")
 
@@ -219,7 +253,10 @@ async def positions(
     db: AsyncSession = Depends(get_db),
     x_client_id: str | None = Header(default=None, alias="X-Client-Id"),
 ):
-    resolved = clientId or x_client_id or "demo-client-1"
+    # Issue #3: Enforce identity like /orders does, don't allow fallback
+    resolved = clientId or x_client_id or None
+    if resolved is None:
+        raise HTTPException(status_code=400, detail="clientId is required (query or X-Client-Id header)")
     repo = PositionsRepository(db)
     items = await repo.by_client(resolved)
     return [PositionSchema(**i) for i in items]
@@ -249,6 +286,7 @@ def to_schema(o: OrderModel) -> OrderSchema:
         type=o.type,
         qty=o.qty,
         price=o.price,
+        timeInForce=o.time_in_force,
         status=o.status,
         cumQty=o.cum_qty,
         filledQty=o.cum_qty,

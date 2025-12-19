@@ -29,6 +29,11 @@ async def startup_event():
     await init_db()
     await fix_gateway.start()
 
+# Issue #6: Clean shutdown of FIX worker task
+@app.on_event("shutdown")
+async def shutdown_event():
+    await fix_gateway.stop()
+
 # Add API routes
 app.include_router(router)
 app.include_router(ws_router)

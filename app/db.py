@@ -10,9 +10,12 @@ from sqlalchemy import text
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./app.db")
 
+# Issue #5: Make connect_args conditional for database portability
+connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+
 engine = create_async_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False},
+    connect_args=connect_args,
     future=True,
 )
 AsyncSessionLocal = async_sessionmaker(
@@ -36,6 +39,15 @@ async def init_db():
             cols = [row[1] for row in res.fetchall()]
             if "reject_reason" not in cols:
                 await conn.execute(text("ALTER TABLE orders ADD COLUMN reject_reason VARCHAR NULL;"))
+            # Issue #3: Add venue ID columns for future Centroid/FIX integration
+            if "cl_ord_id" not in cols:
+                await conn.execute(text("ALTER TABLE orders ADD COLUMN cl_ord_id VARCHAR NULL;"))
+            if "orig_cl_ord_id" not in cols:
+                await conn.execute(text("ALTER TABLE orders ADD COLUMN orig_cl_ord_id VARCHAR NULL;"))
+            if "venue_order_id" not in cols:
+                await conn.execute(text("ALTER TABLE orders ADD COLUMN venue_order_id VARCHAR NULL;"))
+            if "last_exec_id" not in cols:
+                await conn.execute(text("ALTER TABLE orders ADD COLUMN last_exec_id VARCHAR NULL;"))
         except Exception as e:
             # Ignore migration errors in MVP; table may not exist yet or DB may not support PRAGMA
             print(f"[init_db] migration check failed or skipped: {e}")

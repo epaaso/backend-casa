@@ -28,7 +28,7 @@ def create_order():
         "price": 2000.0,
         "timeInForce": "GTC",
     }
-    r = requests.post(f"{BASE}/orders", json=payload)
+    r = requests.post(f"{BASE}/orders", json=payload, headers={"X-Client-Id": "SMOKE"})
     assert r.status_code == 201, f"Expected 201, got {r.status_code}"
     order = r.json()
     print("   Order created:", order["id"])
@@ -36,7 +36,7 @@ def create_order():
 
 
 def get_order(order_id):
-    r = requests.get(f"{BASE}/orders/{order_id}")
+    r = requests.get(f"{BASE}/orders/{order_id}", headers={"X-Client-Id": "SMOKE"})
     assert r.status_code == 200, "Expected 200 for GET order"
     return r.json()
 
@@ -68,7 +68,7 @@ def list_orders():
 def cancel_fake_order():
     print(">> Cancelling non-existing order (expect 404) ...")
     fake_id = str(uuid.uuid4())
-    r = requests.post(f"{BASE}/orders/{fake_id}/cancel")
+    r = requests.post(f"{BASE}/orders/{fake_id}/cancel", headers={"X-Client-Id": "SMOKE"})
     assert r.status_code == 404, f"Expected 404, got {r.status_code}"
     print("   PASSED (404 received)")
 

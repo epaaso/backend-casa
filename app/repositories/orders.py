@@ -29,5 +29,5 @@ class OrderRepository:
         self.db.add(order)
 
     async def set_status(self, order: OrderModel, status: OrderStatus):
-        order.status = status
+        order.status = status.value
         self.db.add(order)

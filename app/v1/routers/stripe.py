@@ -3,6 +3,7 @@ import stripe
 from fastapi import APIRouter, Depends, HTTPException, Request, Header
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
 
 from ...db import get_session
 from ...utils.enums import DepositStatus
@@ -63,27 +64,31 @@ async def create_checkout_session(
         unit_amount = int(float(deposit.amount) * 100)
         print(f"🧮 [STRIPE CHECKOUT] Calculated unit_amount: {deposit.amount} * 100 = {unit_amount} cents (${unit_amount / 100:.2f})")
 
-        session = stripe.checkout.Session.create(
-            payment_method_types=["card"],
-            line_items=[{
-                "price_data": {
-                    "currency": (deposit.currency or "USD").lower(),
-                    "product_data": {
-                        "name": "Depósito a cuenta de trading",
-                        "description": f"Depósito de {deposit.amount} {deposit.currency}",
+        # Issue #3: Wrap blocking Stripe call in threadpool
+        def _create_session():
+            return stripe.checkout.Session.create(
+                payment_method_types=["card"],
+                line_items=[{
+                    "price_data": {
+                        "currency": (deposit.currency or "USD").lower(),
+                        "product_data": {
+                            "name": "Depósito a cuenta de trading",
+                            "description": f"Depósito de {deposit.amount} {deposit.currency}",
+                        },
+                        "unit_amount": unit_amount,
                     },
-                    "unit_amount": unit_amount,
+                    "quantity": 1,
+                }],
+                mode="payment",
+                metadata={
+                    "deposit_id": str(deposit.id),
+                    "client_id": str(client_id),
                 },
-                "quantity": 1,
-            }],
-            mode="payment",
-            metadata={
-                "deposit_id": str(deposit.id),
-                "client_id": str(client_id),
-            },
-            success_url=f"{FRONTEND_URL}/deposit/success?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{FRONTEND_URL}/deposit/cancel",
-        )
+                success_url=f"{FRONTEND_URL}/deposit/success?session_id={{CHECKOUT_SESSION_ID}}",
+                cancel_url=f"{FRONTEND_URL}/deposit/cancel",
+            )
+        
+        session = await run_in_threadpool(_create_session)
 
         deposit.provider = "stripe"
         deposit.provider_reference = session.id
@@ -192,7 +197,11 @@ async def stripe_webhook(
 @router.get("/session/{session_id}")
 async def get_stripe_session(session_id: str):
     try:
-        s = stripe.checkout.Session.retrieve(session_id)
+        # Issue #3: Wrap blocking Stripe call in threadpool
+        def _retrieve():
+            return stripe.checkout.Session.retrieve(session_id)
+        
+        s = await run_in_threadpool(_retrieve)
         return {
             "session_id": s.id,
             "payment_status": s.payment_status,
